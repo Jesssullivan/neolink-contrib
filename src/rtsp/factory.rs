@@ -1,5 +1,5 @@
 use gstreamer::ClockTime;
-use std::{collections::HashMap, time::Duration};
+use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use gstreamer::{prelude::*, Bin, Caps, Element, ElementFactory, FlowError, GhostPad};
@@ -243,20 +243,18 @@ pub(super) async fn make_factory(
                         // Run blocking code on a seperate thread
                         // This is not an async thread
                         std::thread::spawn(move || {
-                            let mut aud_ts = 0u32;
-                            let mut vid_ts = 0u32;
-                            let mut pools = Default::default();
+                            let mut clock = MediaClock::new(stream_config.fps);
+                            let mut stats = TsStats::new(format!("{name}::{stream}"));
 
                             log::trace!("{name}::{stream}: Sending buffered frames");
                             for buffered in buffer.drain(..) {
                                 send_to_sources(
                                     buffered,
-                                    &mut pools,
                                     &vid_src,
                                     &aud_src,
-                                    &mut vid_ts,
-                                    &mut aud_ts,
+                                    &mut clock,
                                     &stream_config,
+                                    &mut stats,
                                 )?;
                             }
 
@@ -264,15 +262,17 @@ pub(super) async fn make_factory(
                             while let Some(data) = media_rx.blocking_recv() {
                                 let r = send_to_sources(
                                     data,
-                                    &mut pools,
                                     &vid_src,
                                     &aud_src,
-                                    &mut vid_ts,
-                                    &mut aud_ts,
+                                    &mut clock,
                                     &stream_config,
+                                    &mut stats,
                                 );
                                 if let Err(r) = &r {
-                                    log::info!("Failed to send to source: {r:?}");
+                                    // Normal at teardown: the media was
+                                    // unprepared while this thread still had
+                                    // frames in flight.
+                                    log::debug!("Failed to send to source: {r:?}");
                                 }
                                 r?;
                             }
@@ -299,65 +299,288 @@ pub(super) async fn make_factory(
     Ok((factory, thread))
 }
 
+/// Generates presentation timestamps for both media channels off one origin.
+///
+/// Each channel advances at its own nominal rate - the frame interval for
+/// video, the decoded frame duration for audio - so spacing stays even. Both
+/// are then nudged each frame to stay locked to a shared monotonic clock.
+///
+/// Without the lock, either channel accumulates error for the whole session:
+/// a real 14.99fps against a nominal 15 is 667ppm, and audio has the same
+/// problem via its sample rate plus any lost frame, which is permanent once
+/// it happens. Sharing one origin is what keeps the two channels in sync with
+/// each other rather than merely each being close to correct on its own.
+struct MediaClock {
+    started: std::time::Instant,
+    vid_pts_us: u64,
+    vid_step_us: u64,
+    aud_pts_us: u64,
+    aud_started: bool,
+    /// Extra lead applied to audio, in microseconds. Positive moves audio
+    /// earlier. Set at runtime with NEOLINK_AUDIO_LEAD_MS for cameras that
+    /// buffer more than a single frame before transmitting.
+    aud_lead_us: i64,
+    vid_snaps: u64,
+    aud_snaps: u64,
+}
+
+impl MediaClock {
+    /// Beyond this video jumps instead of slewing.
+    const VID_SNAP_US: i64 = 1_000_000;
+    /// How far audio may sit off the video timeline before it is realigned
+    /// rather than slewed. Below the ~100ms where desync becomes audible.
+    const AUD_RESYNC_US: i64 = 80_000;
+
+    fn new(fps: u32) -> Self {
+        Self {
+            started: std::time::Instant::now(),
+            vid_pts_us: 0,
+            vid_step_us: 1_000_000 / (fps.max(1) as u64),
+            aud_pts_us: 0,
+            aud_started: false,
+            aud_lead_us: std::env::var("NEOLINK_AUDIO_LEAD_MS")
+                .ok()
+                .and_then(|v| v.trim().parse::<i64>().ok())
+                .unwrap_or(0)
+                .saturating_mul(1000),
+            vid_snaps: 0,
+            aud_snaps: 0,
+        }
+    }
+
+    fn wall_us(&self) -> i64 {
+        self.started.elapsed().as_micros() as i64
+    }
+
+    /// PTS for the next video frame, in microseconds.
+    fn next_video(&mut self, name: &str) -> u64 {
+        let pts = self.vid_pts_us;
+        let err = pts as i64 - self.wall_us();
+
+        if err.abs() > Self::VID_SNAP_US {
+            // Too far out to slew: the stream stalled, the camera slept, or
+            // we are at startup. Jump rather than compressing real elapsed
+            // time into a slow correction.
+            self.vid_snaps += 1;
+            log::debug!("{name}: video clock snap, was {}ms out", err / 1000);
+            let wall = self.wall_us().max(0) as u64;
+            self.vid_pts_us = wall.saturating_add(self.vid_step_us);
+            return wall;
+        }
+
+        // Capped at 1% of a frame interval so frame spacing stays even.
+        let max_corr = (self.vid_step_us / 100).max(1) as i64;
+        let corr = (-err / 64).clamp(-max_corr, max_corr);
+        self.vid_pts_us = self
+            .vid_pts_us
+            .saturating_add((self.vid_step_us as i64 + corr).max(1) as u64);
+        pts
+    }
+
+    /// PTS for the next audio frame, in microseconds. `duration_us` is the
+    /// decoded length of this frame.
+    ///
+    /// Audio carries no camera timestamp - `BcMediaAac` and `BcMediaAdpcm`
+    /// hold only `data`, unlike the video frames which have `microseconds`.
+    /// The camera conveys audio position by interleaving it with video, so
+    /// the video timeline is the anchor, NOT the wall clock. Anchoring to
+    /// arrival time instead puts audio permanently one frame duration late
+    /// and turns every lost packet into accumulated error.
+    fn next_audio(&mut self, duration_us: u64, name: &str) -> u64 {
+        // The frame that has just arrived covers roughly
+        // [anchor - duration, anchor] on the video timeline, because the
+        // encoder could not emit it until the last of its samples existed.
+        let anchor = (self.vid_pts_us as i64)
+            .saturating_sub(duration_us as i64)
+            .saturating_sub(self.aud_lead_us)
+            .max(0);
+
+        if !self.aud_started {
+            self.aud_started = true;
+            self.aud_pts_us = anchor as u64;
+        }
+
+        let err = self.aud_pts_us as i64 - anchor;
+
+        if err.abs() > Self::AUD_RESYNC_US {
+            // Audio frames went missing, so there is a real gap here. Jumping
+            // to the anchor renders it as the short silence it actually is.
+            // Slewing instead would compress the surviving audio and hold the
+            // desync for minutes.
+            self.aud_snaps += 1;
+            log::debug!(
+                "{name}: audio resync, was {}ms off the video clock",
+                err / 1000
+            );
+            self.aud_pts_us = anchor as u64;
+            let pts = self.aud_pts_us;
+            self.aud_pts_us = self.aud_pts_us.saturating_add(duration_us);
+            return pts;
+        }
+
+        // Small residual drift between the accumulated audio duration and the
+        // video timeline gets slewed out, capped at 0.1% of frame duration so
+        // frame spacing stays even and resyncs stay rare.
+        let max_corr = (duration_us / 1000).max(1) as i64;
+        let corr = (-err / 64).clamp(-max_corr, max_corr);
+        let pts = self.aud_pts_us;
+        self.aud_pts_us = self
+            .aud_pts_us
+            .saturating_add((duration_us as i64 + corr).max(1) as u64);
+        pts
+    }
+}
+
+/// Frames discarded by the appsrc queue cap, across all streams.
+/// Diagnostic only.
+static DROPPED_FRAMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Tracks how far the synthesised presentation timestamps have drifted from
+/// real elapsed time. Purely diagnostic - it reads state, never changes it.
+struct TsStats {
+    name: String,
+    started: std::time::Instant,
+    last_report: std::time::Instant,
+    vid_frames: u64,
+    aud_frames: u64,
+    last_aud_pts_us: u64,
+    aud_covered_us: u64,
+    drops_at_last_report: u64,
+}
+
+impl TsStats {
+    fn new(name: String) -> Self {
+        let now = std::time::Instant::now();
+        Self {
+            name,
+            started: now,
+            last_report: now,
+            vid_frames: 0,
+            aud_frames: 0,
+            last_aud_pts_us: 0,
+            aud_covered_us: 0,
+            drops_at_last_report: DROPPED_FRAMES.load(std::sync::atomic::Ordering::Relaxed),
+        }
+    }
+
+    fn note_audio(&mut self, pts_us: u64, duration_us: u64) {
+        self.aud_frames += 1;
+        self.last_aud_pts_us = pts_us;
+        self.aud_covered_us = self.aud_covered_us.saturating_add(duration_us);
+    }
+
+    fn note_video(&mut self, cam_us: u32, pts_us: u64, nominal_fps: u32, clock: &MediaClock) {
+        self.vid_frames += 1;
+        if self.last_report.elapsed() < std::time::Duration::from_secs(60) {
+            return;
+        }
+        self.last_report = std::time::Instant::now();
+
+        let wall_us = self.started.elapsed().as_micros() as i128;
+        let drift_ms = (pts_us as i128 - wall_us) / 1000;
+        let secs = self.started.elapsed().as_secs_f64();
+        let real_fps = if secs > 0.0 {
+            self.vid_frames as f64 / secs
+        } else {
+            0.0
+        };
+        let drops = DROPPED_FRAMES.load(std::sync::atomic::Ordering::Relaxed);
+        let new_drops = drops.saturating_sub(self.drops_at_last_report);
+        self.drops_at_last_report = drops;
+
+        // Skew between the two channels at this instant. Negative means the
+        // audio timeline sits behind the video timeline, i.e. audio plays
+        // early. This is the number to watch for A/V sync.
+        let av_skew_ms = (self.last_aud_pts_us as i128 - pts_us as i128) / 1000;
+        // Fraction of elapsed time actually covered by received audio.
+        // Below 100% means audio frames are being lost in transit, which is a
+        // network problem and not a timestamping one.
+        let aud_coverage = if wall_us > 0 {
+            (self.aud_covered_us as f64 / wall_us as f64) * 100.0
+        } else {
+            0.0
+        };
+
+        log::info!(
+            "{}: uptime {:.0}s | pts {:.1}s vs wall {:.1}s | drift {:+}ms | a/v skew {:+}ms | fps real {:.2} nominal {} | aud frames {} cover {:.1}% | camera ts {:.1}s | dropped {} (+{}) | snaps v{} a{}",
+            self.name,
+            secs,
+            pts_us as f64 / 1e6,
+            wall_us as f64 / 1e6,
+            drift_ms,
+            av_skew_ms,
+            real_fps,
+            nominal_fps,
+            self.aud_frames,
+            aud_coverage,
+            cam_us as f64 / 1e6,
+            drops,
+            new_drops,
+            clock.vid_snaps,
+            clock.aud_snaps,
+        );
+    }
+}
+
 fn send_to_sources(
     data: BcMedia,
-    pools: &mut HashMap<usize, gstreamer::BufferPool>,
     vid_src: &Option<AppSrc>,
     aud_src: &Option<AppSrc>,
-    vid_ts: &mut u32,
-    aud_ts: &mut u32,
+    clock: &mut MediaClock,
     stream_config: &StreamConfig,
+    stats: &mut TsStats,
 ) -> AnyResult<()> {
     // Update TS
     match data {
         BcMedia::Aac(aac) => {
             let duration = aac.duration().expect("Could not calculate AAC duration");
+            let pts = clock.next_audio(duration as u64, &stats.name);
             if let Some(aud_src) = aud_src.as_ref() {
-                log::debug!("Sending AAC: {:?}", Duration::from_micros(*aud_ts as u64));
-                send_to_appsrc(
-                    aud_src,
-                    aac.data,
-                    Duration::from_micros(*aud_ts as u64),
-                    pools,
-                )?;
+                log::debug!("Sending AAC: {:?}", Duration::from_micros(pts));
+                send_to_appsrc(aud_src, aac.data, Duration::from_micros(pts))?;
             }
-            *aud_ts += duration;
+            stats.note_audio(pts, duration as u64);
         }
         BcMedia::Adpcm(adpcm) => {
             let duration = adpcm
                 .duration()
                 .expect("Could not calculate ADPCM duration");
+            let pts = clock.next_audio(duration as u64, &stats.name);
             if let Some(aud_src) = aud_src.as_ref() {
-                log::trace!("Sending ADPCM: {:?}", Duration::from_micros(*aud_ts as u64));
-                send_to_appsrc(
-                    aud_src,
-                    adpcm.data,
-                    Duration::from_micros(*aud_ts as u64),
-                    pools,
-                )?;
+                log::trace!("Sending ADPCM: {:?}", Duration::from_micros(pts));
+                send_to_appsrc(aud_src, adpcm.data, Duration::from_micros(pts))?;
             }
-            *aud_ts += duration;
+            stats.note_audio(pts, duration as u64);
         }
-        BcMedia::Iframe(BcMediaIframe { data, .. })
-        | BcMedia::Pframe(BcMediaPframe { data, .. }) => {
+        BcMedia::Iframe(BcMediaIframe {
+            data, microseconds, ..
+        })
+        | BcMedia::Pframe(BcMediaPframe {
+            data, microseconds, ..
+        }) => {
+            let pts = clock.next_video(&stats.name);
             if let Some(vid_src) = vid_src.as_ref() {
-                log::trace!("Sending VID: {:?}", Duration::from_micros(*vid_ts as u64));
-                send_to_appsrc(vid_src, data, Duration::from_micros(*vid_ts as u64), pools)?;
+                log::trace!("Sending VID: {:?}", Duration::from_micros(pts));
+                send_to_appsrc(vid_src, data, Duration::from_micros(pts))?;
             }
-            const MICROSECONDS: u32 = 1000000;
-            *vid_ts += MICROSECONDS / stream_config.fps;
+            stats.note_video(microseconds, pts, stream_config.fps, clock);
         }
         _ => {}
     }
     Ok(())
 }
 
-fn send_to_appsrc(
-    appsrc: &AppSrc,
-    data: Vec<u8>,
-    mut ts: Duration,
-    pools: &mut HashMap<usize, gstreamer::BufferPool>,
-) -> AnyResult<()> {
+/// How much slack we allow on top of the appsrc's configured `max-bytes`
+/// before we start dropping frames.
+///
+/// `appsrc` is configured with `block = false`, which means `push_buffer`
+/// will keep appending to its internal queue even once `max-bytes` is
+/// exceeded (it only emits `enough-data`, which nothing here listens for).
+/// Without an explicit cap a client that stops consuming makes that queue
+/// grow without limit.
+const APPSRC_QUEUE_SLACK: u64 = 4;
+
+fn send_to_appsrc(appsrc: &AppSrc, data: Vec<u8>, mut ts: Duration) -> AnyResult<()> {
     check_live(appsrc)?; // Stop if appsrc is dropped
 
     // In live mode we follow the advice in
@@ -380,35 +603,41 @@ fn send_to_appsrc(
             return Ok(());
         }
     }
+    // Don't let the appsrc queue grow without bound if the client stalls.
+    // This is a live camera feed: dropping is correct, growing is not.
+    let max_bytes = appsrc.max_bytes();
+    if max_bytes > 0 && appsrc.current_level_bytes() > max_bytes.saturating_mul(APPSRC_QUEUE_SLACK)
+    {
+        DROPPED_FRAMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        log::debug!(
+            "{}: appsrc queue at {} bytes (max-bytes {}), dropping frame",
+            appsrc.name(),
+            appsrc.current_level_bytes(),
+            max_bytes,
+        );
+        return Ok(());
+    }
+
+    // Hand the frame we already own straight to gstreamer.
+    //
+    // The previous implementation kept a `HashMap<usize, BufferPool>` keyed on
+    // the exact byte length of each frame. Compressed frame sizes are
+    // effectively unique, so that map gained a new pool for nearly every
+    // frame, and each new pool immediately preallocated `min_buffers` buffers
+    // of that size. Nothing ever evicted a pool, so the process grew for as
+    // long as it streamed. Wrapping the `Vec` we were handed has no such
+    // retention, and skips a memcpy as a bonus.
     let buf = {
-        let msg_size = data.len();
-
-        // Get or create a pool of this len
-        let pool = pools.entry(msg_size).or_insert_with_key(|size| {
-            let pool = gstreamer::BufferPool::new();
-            let mut pool_config = pool.config();
-            // Set a max buffers to ensure we don't grow in memory endlessly
-            pool_config.set_params(None, (*size) as u32, 8, 32);
-            pool.set_config(pool_config).unwrap();
-            pool.set_active(true).unwrap();
-            pool
-        });
-
-        // Get a buffer from the pool and then copy in the data
-        let gst_buf = {
-            let mut new_buf = pool.acquire_buffer(None).unwrap();
-            let gst_buf_mut = new_buf.get_mut().unwrap();
+        let mut new_buf = gstreamer::Buffer::from_mut_slice(data);
+        {
+            let gst_buf_mut = new_buf
+                .get_mut()
+                .ok_or_else(|| anyhow!("Freshly created buffer was not uniquely owned"))?;
             let time = ClockTime::from_useconds(ts.as_micros() as u64);
             gst_buf_mut.set_dts(time);
             gst_buf_mut.set_pts(time);
-            let mut gst_buf_data = gst_buf_mut.map_writable().unwrap();
-            gst_buf_data.copy_from_slice(data.as_slice());
-            drop(gst_buf_data);
-            new_buf
-        };
-
-        // Return the new buffer with the data
-        gst_buf
+        }
+        new_buf
     };
 
     // Push buffer into the appsrc
@@ -423,25 +652,28 @@ fn send_to_appsrc(
             Ok(())
         }
         Err(FlowError::Flushing) => {
-            // Buffer is full just skip
-            log::info!(
-                "Buffer full on {} pausing stream until client consumes frames",
-                appsrc.name()
+            // NOT "buffer full" - appsrc returns Flushing when the element is
+            // in NULL/READY or a flush is in progress, i.e. the pipeline is
+            // not running. Log the states so this is diagnosable.
+            log::debug!(
+                "Flushing on {}: element state {:?}, parent state {:?}. Frame discarded.",
+                appsrc.name(),
+                appsrc.current_state(),
+                appsrc
+                    .parent()
+                    .and_then(|p| p.downcast::<Element>().ok())
+                    .map(|p| p.current_state()),
             );
             Ok(())
         }
         Err(e) => Err(anyhow!("Error in streaming: {e:?}")),
     }?;
-    // Check if we need to pause
-    if appsrc.current_level_bytes() >= appsrc.max_bytes() * 2 / 3
-        && matches!(appsrc.current_state(), gstreamer::State::Paused)
-    {
-        appsrc.set_state(gstreamer::State::Playing).unwrap();
-    } else if appsrc.current_level_bytes() <= appsrc.max_bytes() / 3
-        && matches!(appsrc.current_state(), gstreamer::State::Playing)
-    {
-        appsrc.set_state(gstreamer::State::Paused).unwrap();
-    }
+    // NOTE: previously this toggled the appsrc element between PAUSED and
+    // PLAYING depending on its fill level. With a client consuming in real
+    // time the level sits near empty, so the appsrc spent most of its time
+    // PAUSED and released frames in bursts, which shows up as stutter-then-
+    // catch-up in viewers. Smoothing is the downstream `queue` element's job;
+    // it is bounded, so it cannot grow without limit the way this appsrc can.
     Ok(())
 }
 fn check_live(app: &AppSrc) -> Result<()> {
