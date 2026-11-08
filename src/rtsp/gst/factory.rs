@@ -35,7 +35,21 @@ impl Default for NeoMediaFactory {
 impl NeoMediaFactory {
     fn new() -> Self {
         let factory = Object::new::<NeoMediaFactory>();
-        factory.set_shared(false);
+        // Share one media - and therefore one camera stream - between every
+        // client on this path, instead of giving each client its own.
+        //
+        // With per-client medias, two clients on the same stream each call
+        // start_video for the same stream code (Main => 0). The camera then
+        // interleaves two subscriptions of the same stream over one Baichuan
+        // connection, which makes audio arrive in bursts relative to video
+        // and thrashes the audio anchor in MediaClock. Worse, StreamData's
+        // Drop sends VIDEO_STOP for that stream code, so whichever client
+        // leaves first stops the stream for the one still watching.
+        //
+        // Sharing is keyed per mount path, so clients must use the same path
+        // string (/AltasFixed2/main and /AltasFixed2/mainStream are different
+        // keys even though both are aliases of the same stream).
+        factory.set_shared(true);
         factory.set_eos_shutdown(false);
         factory.set_stop_on_disconnect(false);
         // factory.set_publish_clock_mode(gstreamer_rtsp_server::RTSPPublishClockMode::Clock);
