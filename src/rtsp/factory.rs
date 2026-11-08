@@ -143,10 +143,41 @@ pub(super) async fn make_dummy_factory(
     .await
 }
 
+/// How long a connecting RTSP client will wait for its pipeline to be built
+/// before we give up. This bounds the time the gst-rtsp-server client thread
+/// can be blocked inside the media factory callback. Without a bound, one
+/// camera that will not deliver frames wedges that thread forever, and every
+/// subsequent client on every camera queues behind it.
+const CLIENT_BUILD_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// How long to wait for enough frames to identify the stream format before
+/// giving up and building whatever we know about. Must be comfortably less
+/// than `CLIENT_BUILD_TIMEOUT`.
+const STREAM_LEARN_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How often an idle frame-pusher thread wakes to check whether its pipeline
+/// still exists. Bounds how long a thread survives after its client has gone
+/// away without the camera sending another frame.
+const IDLE_CHECK_INTERVAL: Duration = Duration::from_secs(10);
+
+/// True while an appsrc is still attached to a live pipeline.
+fn source_alive(src: &AppSrc) -> bool {
+    let element: &Element = src.upcast_ref();
+    element.parent().is_some() && element.current_state() != gstreamer::State::Null
+}
+
+/// True while at least one of this client's sources is still live.
+fn sources_alive(vid: &Option<AppSrc>, aud: &Option<AppSrc>) -> bool {
+    vid.as_ref().is_some_and(source_alive) || aud.as_ref().is_some_and(source_alive)
+}
+
 enum ClientMsg {
     NewClient {
         element: Element,
-        reply: tokio::sync::oneshot::Sender<Element>,
+        /// A std channel rather than a tokio oneshot: the receiving end is
+        /// waited on from the gst-rtsp-server client thread, which is not a
+        /// tokio thread, and `recv_timeout` needs no runtime handle.
+        reply: std::sync::mpsc::SyncSender<Element>,
     },
 }
 
@@ -179,16 +210,37 @@ pub(super) async fn make_factory(
                         let mut frame_count = 0usize;
 
                         let mut stream_config = StreamConfig::new(&camera, stream).await?;
-                        while let Some(media) = media_rx.recv().await {
-                            stream_config.update_from_media(&media);
-                            buffer.push(media);
-                            if frame_count > 10
-                                || (stream_config.vid_type.is_some()
-                                    && stream_config.aud_type.is_some())
-                            {
-                                break;
+                        // Bounded: a camera that never delivers must not hold
+                        // the client thread that is waiting on `reply`.
+                        let learn_deadline = tokio::time::Instant::now() + STREAM_LEARN_TIMEOUT;
+                        loop {
+                            match tokio::time::timeout_at(learn_deadline, media_rx.recv()).await {
+                                Ok(Some(media)) => {
+                                    stream_config.update_from_media(&media);
+                                    buffer.push(media);
+                                    if frame_count > 10
+                                        || (stream_config.vid_type.is_some()
+                                            && stream_config.aud_type.is_some())
+                                    {
+                                        break;
+                                    }
+                                    frame_count += 1;
+                                }
+                                Ok(None) => {
+                                    log::debug!(
+                                        "{name}::{stream}: Camera stream closed while learning format"
+                                    );
+                                    break;
+                                }
+                                Err(_) => {
+                                    log::warn!(
+                                        "{name}::{stream}: Timed out after {}s learning stream format ({} frames); continuing with what is known",
+                                        STREAM_LEARN_TIMEOUT.as_secs(),
+                                        frame_count
+                                    );
+                                    break;
+                                }
                             }
-                            frame_count += 1;
                         }
 
                         log::trace!("{name}::{stream}: Building the pipeline");
@@ -238,10 +290,23 @@ pub(super) async fn make_factory(
 
                         log::trace!("{name}::{stream}: Sending pipeline to gstreamer");
                         // Send the pipeline back to the factory so it can start
-                        let _ = reply.send(element);
+                        // If this fails the client already gave up waiting, so
+                        // returning here drops `media_rx` and releases the
+                        // camera's use-counter permit instead of leaking both
+                        // the stream and the pusher thread below.
+                        if reply.send(element).is_err() {
+                            log::debug!(
+                                "{name}::{stream}: Client gave up before the pipeline was ready; releasing stream"
+                            );
+                            return AnyResult::Ok(());
+                        }
 
                         // Run blocking code on a seperate thread
                         // This is not an async thread
+                        // The handle lets the thread wait on the async channel
+                        // with a timeout; a plain std thread is never inside an
+                        // async context, so block_on is safe here.
+                        let runtime = tokio::runtime::Handle::current();
                         std::thread::spawn(move || {
                             let mut clock = MediaClock::new(stream_config.fps);
                             let mut stats = TsStats::new(format!("{name}::{stream}"));
@@ -259,7 +324,28 @@ pub(super) async fn make_factory(
                             }
 
                             log::trace!("{name}::{stream}: Sending new frames");
-                            while let Some(data) = media_rx.blocking_recv() {
+                            loop {
+                                // Bounded wait so that a client that has gone
+                                // away is noticed even if the camera has also
+                                // stopped sending. An unbounded blocking_recv
+                                // here strands the thread, and with it the
+                                // camera stream it holds open, until restart.
+                                let next = runtime.block_on(async {
+                                    tokio::time::timeout(IDLE_CHECK_INTERVAL, media_rx.recv()).await
+                                });
+                                let data = match next {
+                                    Ok(Some(data)) => data,
+                                    Ok(None) => break,
+                                    Err(_) => {
+                                        if sources_alive(&vid_src, &aud_src) {
+                                            continue;
+                                        }
+                                        log::debug!(
+                                            "{name}::{stream}: Pipeline gone while idle; stopping"
+                                        );
+                                        break;
+                                    }
+                                };
                                 let r = send_to_sources(
                                     data,
                                     &vid_src,
@@ -289,11 +375,20 @@ pub(super) async fn make_factory(
 
     // Now setup the factory
     let factory = NeoMediaFactory::new_with_callback(move |element| {
-        let (reply, new_element) = tokio::sync::oneshot::channel();
-        client_tx.blocking_send(ClientMsg::NewClient { element, reply })?;
+        let (reply, new_element) = std::sync::mpsc::sync_channel::<Element>(1);
+        // try_send, not blocking_send: if the builder task is wedged we must
+        // fail this client rather than block the shared client thread.
+        client_tx
+            .try_send(ClientMsg::NewClient { element, reply })
+            .map_err(|e| anyhow!("Pipeline builder is not accepting clients: {e}"))?;
 
-        let element = new_element.blocking_recv()?;
-        Ok(Some(element))
+        match new_element.recv_timeout(CLIENT_BUILD_TIMEOUT) {
+            Ok(element) => Ok(Some(element)),
+            Err(e) => Err(anyhow!(
+                "Timed out after {}s waiting for the pipeline: {e}",
+                CLIENT_BUILD_TIMEOUT.as_secs()
+            )),
+        }
     })
     .await?;
     Ok((factory, thread))
