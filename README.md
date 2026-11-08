@@ -1,7 +1,7 @@
 # Neolink
 
-![CI](https://github.com/QuantumEntangledAndy/neolink/workflows/CI/badge.svg)
-[![dependency status](https://deps.rs/repo/github/QuantumEntangledAndy/neolink/status.svg)](https://deps.rs/repo/github/QuantumEntangledAndy/neolink)
+![CI](https://github.com/alexbahder/neolink/workflows/CI/badge.svg)
+[![dependency status](https://deps.rs/repo/github/alexbahder/neolink/status.svg)](https://deps.rs/repo/github/alexbahder/neolink)
 
 Neolink is a small program that acts as a proxy between Reolink IP cameras and
 normal RTSP clients.
