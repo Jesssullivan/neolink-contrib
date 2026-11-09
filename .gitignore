@@ -28,3 +28,11 @@ token.toml
 
 # Debug FCM build
 crates/fcm-push-listener
+
+# Agent tooling stays out of git: it lives on the fork-only agents-overlay
+# branch of Jesssullivan/neolink-contrib and is excluded per clone.
+.claude/
+.agents/
+AGENTS.md
+CLAUDE.md
+CLAUDE.local.md

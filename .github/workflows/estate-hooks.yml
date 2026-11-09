@@ -1,0 +1,32 @@
+name: Estate hooks
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+
+jobs:
+  hooks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Hook self-test
+        run: bash .githooks/test.sh
+      - name: No AI attribution above alexbahder/neolink master
+        run: |
+          git remote add alex https://github.com/alexbahder/neolink.git
+          git fetch --quiet alex master
+          . .githooks/_lib.sh
+          status=0
+          for sha in $(git rev-list HEAD --not alex/master); do
+            if line="$(git log -1 --format=%B "$sha" | gftb_ai_attribution_line)"; then
+              echo "::error::$(git rev-parse --short "$sha") carries AI attribution: $line"
+              status=1
+            fi
+          done
+          exit "$status"

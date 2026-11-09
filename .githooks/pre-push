@@ -1,0 +1,99 @@
+#!/usr/bin/env bash
+# Great Falls Tool Bus pre-push hook.
+# Refuses: a push to any Great-Falls-Tool-Bus remote, unsigned commits and AI
+# attribution in the pushed range. Warns: branch name without a semantic prefix.
+# The pushed range is every commit not already on a remote-tracking ref.
+set -u
+
+# shellcheck source=_lib.sh
+. "$(dirname "$0")/_lib.sh"
+
+remote_name="${1:-}"
+remote_url="${2:-}"
+
+# True for the all-zero object name git uses for a missing ref, in either
+# object format (40 hex digits for SHA-1, 64 for SHA-256).
+gftb_is_null_oid() {
+  case "$1" in
+    "" | *[!0]*) return 1 ;;
+  esac
+  return 0
+}
+
+# The argument that makes `git rebase` start at the given commit.
+gftb_rebase_base() {
+  if git rev-parse -q --verify "$1~1" >/dev/null; then
+    git rev-parse --short "$1~1"
+  else
+    printf -- '--root\n'
+  fi
+}
+
+input="$(mktemp "${TMPDIR:-/tmp}/gftb-pre-push.XXXXXX")"
+trap 'rm -f "$input"' EXIT
+cat > "$input"
+
+if printf '%s\n' "$remote_url" | grep -iqE 'github\.com[:/]+Great-Falls-Tool-Bus/'; then
+  gftb_refuse "push to the organization remote '$remote_name' ($remote_url); work lands only through a pull request from your fork" \
+    "Fork first" \
+    "git push origin HEAD && git config remote.pushDefault origin   # then open the pull request from your fork"
+  exit 1
+fi
+
+while read -r local_ref local_sha remote_ref remote_sha; do
+  [ -n "${local_sha:-}" ] || continue
+  if gftb_is_null_oid "$local_sha"; then continue; fi
+
+  case "$remote_ref" in
+    refs/heads/*)
+      branch="${remote_ref#refs/heads/}"
+      if ! printf '%s\n' "$branch" | grep -qE '^(feat|fix|hotfix|docs|chore|ci)/[a-z0-9][a-z0-9.-]*$'; then
+        gftb_warn "branch '$branch' has no semantic prefix (feat/ fix/ hotfix/ docs/ chore/ ci/) and kebab-case slug" \
+          "Branches" \
+          "git branch -m '${local_ref#refs/heads/}' feat/short-slug && git push origin feat/short-slug"
+      fi
+      ;;
+  esac
+
+  exclude=(--not --remotes)
+  if ! gftb_is_null_oid "$remote_sha" && git cat-file -e "$remote_sha^{commit}" 2>/dev/null; then
+    exclude+=("$remote_sha")
+  fi
+
+  unsigned=""
+  oldest_unsigned=""
+  for sha in $(git rev-list "$local_sha" "${exclude[@]}"); do
+    raw="$(git cat-file commit "$sha")"
+    header="$(printf '%s\n' "$raw" | sed '/^$/q')"
+    message="$(printf '%s\n' "$raw" | sed '1,/^$/d')"
+    short="$(git rev-parse --short "$sha")"
+
+    if ! printf '%s\n' "$header" | grep -qE '^gpgsig(-sha256)? '; then
+      parents="$(printf '%s\n' "$header" | grep -c '^parent ')"
+      if [ "$parents" -gt 1 ] && printf '%s\n' "$header" | grep -qE '^committer GitHub <noreply@github\.com> '; then
+        : # merge commits made by GitHub are exempt
+      else
+        unsigned="$short${unsigned:+ $unsigned}"
+        oldest_unsigned="$sha"
+      fi
+    fi
+
+    if line="$(printf '%s\n' "$message" | gftb_ai_attribution_line)"; then
+      gftb_refuse "commit $short carries AI attribution: $line" \
+        "Commits" \
+        "git rebase -i $(gftb_rebase_base "$sha")   # mark $short as reword, delete that line, then git push origin HEAD --force-with-lease"
+    fi
+  done
+
+  if [ -n "$oldest_unsigned" ]; then
+    gftb_refuse "unsigned commits in the pushed range: $unsigned" \
+      "Commits" \
+      "git config commit.gpgsign true && git rebase --force-rebase --gpg-sign $(gftb_rebase_base "$oldest_unsigned") && git push origin HEAD --force-with-lease"
+  fi
+done < "$input"
+
+if [ "$GFTB_REFUSED" -ne 0 ]; then
+  exit 1
+fi
+
+gftb_chain pre-push "$input" "$remote_name" "$remote_url"
