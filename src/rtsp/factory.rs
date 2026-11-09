@@ -357,6 +357,10 @@ pub(super) async fn make_factory(
                             };
                             let mut clock = MediaClock::new(stream_config.fps);
                             let mut stats = TsStats::new(format!("{name}::{stream}"));
+                            // P-frames are dropped until a keyframe has been
+                            // pushed: at start, after any dropped frame and
+                            // after resubscribing to the camera.
+                            let mut need_keyframe = true;
 
                             log::trace!("{name}::{stream}: Sending buffered frames");
                             for buffered in buffer.drain(..) {
@@ -367,6 +371,7 @@ pub(super) async fn make_factory(
                                     &mut clock,
                                     &stream_config,
                                     &mut stats,
+                                    &mut need_keyframe,
                                 )?;
                             }
 
@@ -409,6 +414,7 @@ pub(super) async fn make_factory(
                                                         "{name}::{stream}: Camera stream resubscribed"
                                                     );
                                                     media_rx = new_rx;
+                                                    need_keyframe = true;
                                                     continue 'frames;
                                                 }
                                                 Err(e) => {
@@ -444,6 +450,7 @@ pub(super) async fn make_factory(
                                     &mut clock,
                                     &stream_config,
                                     &mut stats,
+                                    &mut need_keyframe,
                                 );
                                 if let Err(r) = &r {
                                     // Normal at teardown: the media was
@@ -791,7 +798,9 @@ fn send_to_sources(
     clock: &mut MediaClock,
     stream_config: &StreamConfig,
     stats: &mut TsStats,
+    need_keyframe: &mut bool,
 ) -> AnyResult<()> {
+    let keyframe = matches!(data, BcMedia::Iframe(_));
     // Update TS
     match data {
         BcMedia::Aac(aac) => {
@@ -824,8 +833,13 @@ fn send_to_sources(
         }) => {
             let pts = clock.next_video(microseconds, &stats.name);
             if let Some(vid_src) = vid_src.as_ref() {
-                log::trace!("Sending VID: {:?}", Duration::from_micros(pts));
-                send_to_appsrc(vid_src, data, Duration::from_micros(pts))?;
+                // A P-frame after a missing frame decodes against the wrong
+                // reference and smears until the next keyframe, so wait for
+                // that keyframe instead.
+                if keyframe || !*need_keyframe {
+                    log::trace!("Sending VID: {:?}", Duration::from_micros(pts));
+                    *need_keyframe = !send_to_appsrc(vid_src, data, Duration::from_micros(pts))?;
+                }
             }
             stats.note_video(microseconds, pts, stream_config.fps, clock);
         }
@@ -844,7 +858,8 @@ fn send_to_sources(
 /// grow without limit.
 const APPSRC_QUEUE_SLACK: u64 = 4;
 
-fn send_to_appsrc(appsrc: &AppSrc, data: Vec<u8>, mut ts: Duration) -> AnyResult<()> {
+/// Returns whether the frame was pushed; false when it was dropped.
+fn send_to_appsrc(appsrc: &AppSrc, data: Vec<u8>, mut ts: Duration) -> AnyResult<bool> {
     check_live(appsrc)?; // Stop if appsrc is dropped
 
     // In live mode we follow the advice in
@@ -860,11 +875,11 @@ fn send_to_appsrc(appsrc: &AppSrc, data: Vec<u8>, mut ts: Duration) -> AnyResult
                 ts = Duration::from_micros(time.useconds());
             } else {
                 // Not playing
-                return Ok(());
+                return Ok(false);
             }
         } else {
             // Clock not up yet
-            return Ok(());
+            return Ok(false);
         }
     }
     // Don't let the appsrc queue grow without bound if the client stalls.
@@ -879,7 +894,7 @@ fn send_to_appsrc(appsrc: &AppSrc, data: Vec<u8>, mut ts: Duration) -> AnyResult
             appsrc.current_level_bytes(),
             max_bytes,
         );
-        return Ok(());
+        return Ok(false);
     }
 
     // Hand the frame we already own straight to gstreamer.
@@ -905,7 +920,7 @@ fn send_to_appsrc(appsrc: &AppSrc, data: Vec<u8>, mut ts: Duration) -> AnyResult
     };
 
     // Push buffer into the appsrc
-    match appsrc.push_buffer(buf) {
+    let pushed = match appsrc.push_buffer(buf) {
         Ok(_) => {
             // log::info!(
             //     "Send {}{} on {}",
@@ -913,7 +928,7 @@ fn send_to_appsrc(appsrc: &AppSrc, data: Vec<u8>, mut ts: Duration) -> AnyResult
             //     if data.keyframe { " (keyframe)" } else { "" },
             //     appsrc.name()
             // );
-            Ok(())
+            Ok(true)
         }
         Err(FlowError::Flushing) => {
             // NOT "buffer full" - appsrc returns Flushing when the element is
@@ -928,7 +943,7 @@ fn send_to_appsrc(appsrc: &AppSrc, data: Vec<u8>, mut ts: Duration) -> AnyResult
                     .and_then(|p| p.downcast::<Element>().ok())
                     .map(|p| p.current_state()),
             );
-            Ok(())
+            Ok(false)
         }
         Err(e) => Err(anyhow!("Error in streaming: {e:?}")),
     }?;
@@ -938,7 +953,7 @@ fn send_to_appsrc(appsrc: &AppSrc, data: Vec<u8>, mut ts: Duration) -> AnyResult
     // PAUSED and released frames in bursts, which shows up as stutter-then-
     // catch-up in viewers. Smoothing is the downstream `queue` element's job;
     // it is bounded, so it cannot grow without limit the way this appsrc can.
-    Ok(())
+    Ok(pushed)
 }
 fn check_live(app: &AppSrc) -> Result<()> {
     app.bus().ok_or(anyhow!("App source is closed"))?;
@@ -1052,6 +1067,9 @@ fn build_h264(bin: &Element, stream_config: &StreamConfig) -> Result<AppSrc> {
         .map_err(|_| anyhow!("Media source's element should be a bin"))?;
 
     let payload = make_element("rtph264pay", "pay0")?;
+    // Repeat SPS and PPS with every IDR frame, so a client that joins or
+    // loses packets mid-stream can start decoding at the next keyframe.
+    payload.set_property("config-interval", -1i32);
     bin.add_many([&payload])?;
     Element::link_many([&linked.output, &payload])?;
     Ok(linked.appsrc)
@@ -1103,6 +1121,8 @@ fn build_h265(bin: &Element, stream_config: &StreamConfig) -> Result<AppSrc> {
         .map_err(|_| anyhow!("Media source's element should be a bin"))?;
 
     let payload = make_element("rtph265pay", "pay0")?;
+    // Repeat VPS, SPS and PPS with every IDR frame, as for H264.
+    payload.set_property("config-interval", -1i32);
     bin.add_many([&payload])?;
     Element::link_many([&linked.output, &payload])?;
     Ok(linked.appsrc)
