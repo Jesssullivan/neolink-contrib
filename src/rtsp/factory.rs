@@ -372,6 +372,10 @@ pub(super) async fn make_factory(
 
                             log::trace!("{name}::{stream}: Sending new frames");
                             let mut backoff = RESUBSCRIBE_BACKOFF_MIN;
+                            // The pipeline is still NULL while gst-rtsp-server
+                            // prepares it, so only a pipeline that has been
+                            // live and then went back to NULL counts as gone.
+                            let mut was_live = false;
                             'frames: loop {
                                 // Bounded wait so that a client that has gone
                                 // away is noticed even if the camera has also
@@ -440,6 +444,18 @@ pub(super) async fn make_factory(
                                     log::debug!("Failed to send to source: {r:?}");
                                 }
                                 r?;
+                                // An unprepared media leaves this bin in a
+                                // NULL pipeline where pushes still succeed
+                                // (as Flushing), so check after every frame
+                                // rather than only when the camera goes idle.
+                                // Otherwise this thread keeps the camera
+                                // stream open for a pipeline nobody plays.
+                                if sources_alive(&vid_src, &aud_src) {
+                                    was_live = true;
+                                } else if was_live {
+                                    log::debug!("{name}::{stream}: Pipeline gone; stopping");
+                                    break;
+                                }
                             }
                             log::trace!("All media recieved");
                             AnyResult::Ok(())
