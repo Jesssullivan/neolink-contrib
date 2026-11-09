@@ -4,12 +4,14 @@ use std::time::Duration;
 use anyhow::{anyhow, Context, Result};
 use gstreamer::{prelude::*, Bin, Caps, Element, ElementFactory, FlowError, GhostPad};
 use gstreamer_app::{AppSrc, AppSrcCallbacks, AppStreamType};
+use gstreamer_rtsp_server::{prelude::*, RTSPMedia};
 use neolink_core::{
     bc_protocol::StreamKind,
     bcmedia::model::{
         BcMedia, BcMediaIframe, BcMediaInfoV1, BcMediaInfoV2, BcMediaPframe, VideoType,
     },
 };
+use std::sync::{Arc, Mutex, OnceLock};
 use tokio::{sync::mpsc::channel as mpsc, task::JoinHandle};
 
 use crate::{common::NeoInstance, rtsp::gst::NeoMediaFactory, AnyResult};
@@ -176,6 +178,31 @@ fn sources_alive(vid: &Option<AppSrc>, aud: &Option<AppSrc>) -> bool {
     vid.as_ref().is_some_and(source_alive) || aud.as_ref().is_some_and(source_alive)
 }
 
+/// The media that a pipeline ends up in. It is filled in by the factory's
+/// media-configure handler, which runs after the pipeline has been built.
+type MediaSlot = Arc<OnceLock<gstreamer::glib::WeakRef<RTSPMedia>>>;
+
+/// Runs when a frame pusher exits, however it exits. Nothing will feed this
+/// media again, so end its streams and stop handing it to new clients;
+/// otherwise the shared media stays cached and every later client joins a
+/// pipeline that never gets another frame.
+struct PusherExit {
+    vid_src: Option<AppSrc>,
+    aud_src: Option<AppSrc>,
+    media: MediaSlot,
+}
+
+impl Drop for PusherExit {
+    fn drop(&mut self) {
+        for src in self.vid_src.iter().chain(self.aud_src.iter()) {
+            let _ = src.end_of_stream();
+        }
+        if let Some(media) = self.media.get().and_then(|media| media.upgrade()) {
+            media.set_shared(false);
+        }
+    }
+}
+
 enum ClientMsg {
     NewClient {
         element: Element,
@@ -183,6 +210,7 @@ enum ClientMsg {
         /// waited on from the gst-rtsp-server client thread, which is not a
         /// tokio thread, and `recv_timeout` needs no runtime handle.
         reply: std::sync::mpsc::SyncSender<Element>,
+        media: MediaSlot,
     },
 }
 
@@ -197,7 +225,11 @@ pub(super) async fn make_factory(
 
         while let Some(msg) = client_rx.recv().await {
             match msg {
-                ClientMsg::NewClient { element, reply } => {
+                ClientMsg::NewClient {
+                    element,
+                    reply,
+                    media,
+                } => {
                     log::debug!("New client for {name}::{stream}");
                     let camera = camera.clone();
                     let name = name.clone();
@@ -206,7 +238,6 @@ pub(super) async fn make_factory(
                         log::trace!("{name}::{stream}: Starting camera");
 
                         // Start the camera
-                        let config = camera.config().await?.borrow().clone();
                         let mut media_rx = camera.stream_while_live(stream).await?;
 
                         log::trace!("{name}::{stream}: Learning camera stream type");
@@ -260,8 +291,14 @@ pub(super) async fn make_factory(
                                 AnyResult::Ok(Some(src))
                             }
                             None => {
-                                build_unknown(&element, &config.splash_pattern.to_string())?;
-                                AnyResult::Ok(None)
+                                // A splash here would be cached as the shared
+                                // media and end after its test buffers, so
+                                // every later client would get a dead stream.
+                                // Refuse this client instead; it will retry.
+                                log::warn!(
+                                    "{name}::{stream}: No video while learning stream format; refusing client"
+                                );
+                                return AnyResult::Ok(());
                             }
                         }?;
 
@@ -313,6 +350,11 @@ pub(super) async fn make_factory(
                         // async context, so block_on is safe here.
                         let runtime = tokio::runtime::Handle::current();
                         std::thread::spawn(move || {
+                            let _exit = PusherExit {
+                                vid_src: vid_src.clone(),
+                                aud_src: aud_src.clone(),
+                                media,
+                            };
                             let mut clock = MediaClock::new(stream_config.fps);
                             let mut stats = TsStats::new(format!("{name}::{stream}"));
 
@@ -410,17 +452,34 @@ pub(super) async fn make_factory(
         AnyResult::Ok(())
     });
 
+    // gst-rtsp-server builds the element and then configures its media in one
+    // call, under the factory's media lock, so a single pending slot is enough
+    // to pair each pipeline with its media.
+    let pending_media: Arc<Mutex<Option<MediaSlot>>> = Default::default();
+    let callback_pending = pending_media.clone();
+
     // Now setup the factory
     let factory = NeoMediaFactory::new_with_callback(move |element| {
         let (reply, new_element) = std::sync::mpsc::sync_channel::<Element>(1);
+        let media = MediaSlot::default();
+        if let Ok(mut pending) = callback_pending.lock() {
+            pending.replace(media.clone());
+        }
         // try_send, not blocking_send: if the builder task is wedged we must
         // fail this client rather than block the shared client thread.
         client_tx
-            .try_send(ClientMsg::NewClient { element, reply })
+            .try_send(ClientMsg::NewClient {
+                element,
+                reply,
+                media,
+            })
             .map_err(|e| anyhow!("Pipeline builder is not accepting clients: {e}"))?;
 
         match new_element.recv_timeout(CLIENT_BUILD_TIMEOUT) {
             Ok(element) => Ok(Some(element)),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                Err(anyhow!("Pipeline builder gave up without a pipeline"))
+            }
             Err(e) => Err(anyhow!(
                 "Timed out after {}s waiting for the pipeline: {e}",
                 CLIENT_BUILD_TIMEOUT.as_secs()
@@ -428,6 +487,11 @@ pub(super) async fn make_factory(
         }
     })
     .await?;
+    factory.connect_media_configure(move |_, media| {
+        if let Some(slot) = pending_media.lock().ok().and_then(|mut p| p.take()) {
+            let _ = slot.set(media.downgrade());
+        }
+    });
     Ok((factory, thread))
 }
 
