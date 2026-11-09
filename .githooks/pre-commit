@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# Great Falls Tool Bus pre-commit hook.
+# Warns: em dashes added to a file that had none. Never refuses.
+set -u
+
+# shellcheck source=_lib.sh
+. "$(dirname "$0")/_lib.sh"
+
+if git rev-parse --verify -q HEAD >/dev/null; then
+  base=HEAD
+else
+  base="$(git hash-object -t tree /dev/null)"
+fi
+
+git diff --cached --name-only --diff-filter=AM -z "$base" -- | while IFS= read -r -d '' path; do
+  # Files that already carry em dashes may keep them until rewritten.
+  if git cat-file -e "$base:$path" 2>/dev/null &&
+    git show "$base:$path" 2>/dev/null | grep -qF "$GFTB_EM_DASH"; then
+    continue
+  fi
+  if git diff --cached -U0 "$base" -- "$path" | grep -E '^\+' | grep -vE '^\+\+\+ ' | grep -qF "$GFTB_EM_DASH"; then
+    gftb_warn "em dash added to $path" \
+      "Commits" \
+      "grep -n \"\$(printf '\\342\\200\\224')\" '$path'   # replace each with a comma, colon or parentheses, then git add '$path'"
+  fi
+done
+
+gftb_chain pre-commit "" "$@"

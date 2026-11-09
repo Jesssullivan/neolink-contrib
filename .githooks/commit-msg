@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# Great Falls Tool Bus commit-msg hook.
+# Refuses: AI attribution lines. Warns: non-conventional subject, em dashes.
+set -u
+
+# shellcheck source=_lib.sh
+. "$(dirname "$0")/_lib.sh"
+
+msg_file="$1"
+text="$(gftb_message_text "$msg_file")"
+subject="$(printf '%s\n' "$text" | sed -n '/[^[:space:]]/{p;q;}')"
+
+if line="$(printf '%s\n' "$text" | gftb_ai_attribution_line)"; then
+  gftb_refuse "commit message carries AI attribution: $line" \
+    "Commits" \
+    "git commit --amend   # delete that line, then commit again; edit $msg_file the same way"
+fi
+
+if [ "$GFTB_REFUSED" -ne 0 ]; then
+  exit 1
+fi
+
+case "$subject" in
+  "Merge "* | "Revert "* | "fixup! "* | "squash! "* | "amend! "*) ;;
+  *)
+    if ! printf '%s\n' "$subject" | grep -qE '^(feat|fix|hotfix|docs|chore|ci|build|perf|refactor|revert|style|test)(\([a-z0-9._/-]+\))?!?: [^[:space:]]'; then
+      gftb_warn "subject is not a conventional commit subject: $subject" \
+        "Commits" \
+        "git commit --amend -m \"fix(scope): short summary\"   # type(scope): summary, scope optional"
+    fi
+    ;;
+esac
+
+if printf '%s\n' "$text" | grep -qF "$GFTB_EM_DASH"; then
+  gftb_warn "commit message contains an em dash" \
+    "Commits" \
+    "git commit --amend   # replace the em dash with a comma, colon or parentheses"
+fi
+
+gftb_chain commit-msg "" "$@"
