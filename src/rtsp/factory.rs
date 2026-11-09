@@ -160,6 +160,11 @@ const STREAM_LEARN_TIMEOUT: Duration = Duration::from_secs(10);
 /// away without the camera sending another frame.
 const IDLE_CHECK_INTERVAL: Duration = Duration::from_secs(10);
 
+/// Backoff between attempts to resubscribe to the camera after its stream
+/// ends while a client is still watching. Doubles up to the max.
+const RESUBSCRIBE_BACKOFF_MIN: Duration = Duration::from_secs(1);
+const RESUBSCRIBE_BACKOFF_MAX: Duration = Duration::from_secs(10);
+
 /// True while an appsrc is still attached to a live pipeline.
 fn source_alive(src: &AppSrc) -> bool {
     let element: &Element = src.upcast_ref();
@@ -324,7 +329,8 @@ pub(super) async fn make_factory(
                             }
 
                             log::trace!("{name}::{stream}: Sending new frames");
-                            loop {
+                            let mut backoff = RESUBSCRIBE_BACKOFF_MIN;
+                            'frames: loop {
                                 // Bounded wait so that a client that has gone
                                 // away is noticed even if the camera has also
                                 // stopped sending. An unbounded blocking_recv
@@ -334,8 +340,39 @@ pub(super) async fn make_factory(
                                     tokio::time::timeout(IDLE_CHECK_INTERVAL, media_rx.recv()).await
                                 });
                                 let data = match next {
-                                    Ok(Some(data)) => data,
-                                    Ok(None) => break,
+                                    Ok(Some(data)) => {
+                                        backoff = RESUBSCRIBE_BACKOFF_MIN;
+                                        data
+                                    }
+                                    Ok(None) => {
+                                        // The camera side ended (relogin,
+                                        // dropped connection) but the client
+                                        // is still watching. Subscribe again
+                                        // rather than leave it on a media
+                                        // that will never get another frame.
+                                        loop {
+                                            std::thread::sleep(backoff);
+                                            backoff = (backoff * 2).min(RESUBSCRIBE_BACKOFF_MAX);
+                                            if !sources_alive(&vid_src, &aud_src) {
+                                                break 'frames;
+                                            }
+                                            match runtime.block_on(camera.stream_while_live(stream))
+                                            {
+                                                Ok(new_rx) => {
+                                                    log::debug!(
+                                                        "{name}::{stream}: Camera stream resubscribed"
+                                                    );
+                                                    media_rx = new_rx;
+                                                    continue 'frames;
+                                                }
+                                                Err(e) => {
+                                                    log::debug!(
+                                                        "{name}::{stream}: Camera stream resubscribe failed: {e:?}"
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    }
                                     Err(_) => {
                                         if sources_alive(&vid_src, &aud_src) {
                                             continue;
