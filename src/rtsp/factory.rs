@@ -423,6 +423,7 @@ pub(super) async fn make_factory(
                                                     );
                                                     media_rx = new_rx;
                                                     need_keyframe = true;
+                                                    clock.camera_restarted();
                                                     continue 'frames;
                                                 }
                                                 Ok(Err(e)) => {
@@ -448,6 +449,14 @@ pub(super) async fn make_factory(
                                         break;
                                     }
                                 };
+                                // Follow a frame rate change reported
+                                // mid-stream.
+                                if let BcMedia::InfoV1(BcMediaInfoV1 { fps, .. })
+                                | BcMedia::InfoV2(BcMediaInfoV2 { fps, .. }) = &data
+                                {
+                                    stream_config.update_fps(*fps as u32);
+                                    clock.set_fps(stream_config.fps);
+                                }
                                 let r = send_to_sources(
                                     data,
                                     &vid_src,
@@ -546,6 +555,11 @@ struct MediaClock {
     started: std::time::Instant,
     vid_pts_us: u64,
     vid_step_us: u64,
+    /// PTS of the last video frame handed out. `vid_pts_us` is already the
+    /// next frame's PTS, one step later. None until the first video frame.
+    last_vid_pts_us: Option<u64>,
+    /// Camera timestamp of the last video frame, for frame spacing.
+    last_cam_us: Option<u32>,
     aud_pts_us: u64,
     aud_started: bool,
     /// Extra lead applied to audio, in microseconds. Positive moves audio
@@ -557,17 +571,21 @@ struct MediaClock {
 }
 
 impl MediaClock {
-    /// Beyond this video jumps instead of slewing.
+    /// Video further behind the wall clock than this jumps forward instead
+    /// of slewing.
     const VID_SNAP_US: i64 = 1_000_000;
-    /// How far audio may sit off the video timeline before it is realigned
-    /// rather than slewed. Below the ~100ms where desync becomes audible.
-    const AUD_RESYNC_US: i64 = 80_000;
+    /// Audio further behind the video timeline than this jumps forward
+    /// instead of slewing. Wider than two 64ms AAC frames, so audio that
+    /// arrives a few frames at a time does not trip it.
+    const AUD_RESYNC_US: i64 = 150_000;
 
     fn new(fps: u32) -> Self {
         Self {
             started: std::time::Instant::now(),
             vid_pts_us: 0,
             vid_step_us: 1_000_000 / (fps.max(1) as u64),
+            last_vid_pts_us: None,
+            last_cam_us: None,
             aud_pts_us: 0,
             aud_started: false,
             aud_lead_us: std::env::var("NEOLINK_AUDIO_LEAD_MS")
@@ -584,28 +602,62 @@ impl MediaClock {
         self.started.elapsed().as_micros() as i64
     }
 
-    /// PTS for the next video frame, in microseconds.
-    fn next_video(&mut self, name: &str) -> u64 {
-        let pts = self.vid_pts_us;
-        let err = pts as i64 - self.wall_us();
+    /// A new camera stream may restart its frame timestamps, so the next
+    /// frame is spaced by the nominal step rather than by a bogus delta.
+    fn camera_restarted(&mut self) {
+        self.last_cam_us = None;
+    }
 
-        if err.abs() > Self::VID_SNAP_US {
-            // Too far out to slew: the stream stalled, the camera slept, or
-            // we are at startup. Jump rather than compressing real elapsed
+    /// Nominal frame rate, used where the camera gives no frame spacing.
+    fn set_fps(&mut self, fps: u32) {
+        self.vid_step_us = 1_000_000 / (fps.max(1) as u64);
+    }
+
+    /// PTS for the next video frame, in microseconds. `cam_us` is the
+    /// camera's timestamp for this frame.
+    fn next_video(&mut self, cam_us: u32, name: &str) -> u64 {
+        let wall_us = self.wall_us();
+        self.next_video_at(wall_us, cam_us, name)
+    }
+
+    /// `next_video` with the wall clock passed in, so tests can drive it.
+    ///
+    /// PTS only ever moves forward. A backward step makes downstream
+    /// elements and players drop or reorder frames.
+    fn next_video_at(&mut self, wall_us: i64, cam_us: u32, name: &str) -> u64 {
+        let pts = self.vid_pts_us;
+        let err = pts as i64 - wall_us;
+
+        // Space frames by the camera's own timestamps, so PTS follows the
+        // rate the camera actually delivers rather than the configured one.
+        // A camera set to 15 fps that sends 12 would otherwise fall behind
+        // the wall clock faster than the slew can follow, and snap every
+        // few seconds. Clamped so one bad timestamp cannot run away.
+        let nominal = self.vid_step_us as i64;
+        let step = match self.last_cam_us.replace(cam_us) {
+            Some(last) => (cam_us.wrapping_sub(last) as i64).clamp(nominal / 4, nominal * 4),
+            None => nominal,
+        };
+
+        if err < -Self::VID_SNAP_US {
+            // Too far behind to slew: the stream stalled, the camera slept,
+            // or we are at startup. Jump rather than compressing real elapsed
             // time into a slow correction.
             self.vid_snaps += 1;
             log::debug!("{name}: video clock snap, was {}ms out", err / 1000);
-            let wall = self.wall_us().max(0) as u64;
-            self.vid_pts_us = wall.saturating_add(self.vid_step_us);
+            let wall = wall_us.max(0) as u64;
+            self.vid_pts_us = wall.saturating_add(step as u64);
+            self.last_vid_pts_us = Some(wall);
             return wall;
         }
 
-        // Capped at 1% of a frame interval so frame spacing stays even.
-        let max_corr = (self.vid_step_us / 100).max(1) as i64;
-        let corr = (-err / 64).clamp(-max_corr, max_corr);
-        self.vid_pts_us = self
-            .vid_pts_us
-            .saturating_add((self.vid_step_us as i64 + corr).max(1) as u64);
+        // Behind: capped at 1% of a frame interval so frame spacing stays
+        // even. Ahead, typically after the burst that follows a stall: up to
+        // half an interval, so the lead drains in seconds while every PTS
+        // still lands after the one before it.
+        let corr = (-err / 64).clamp(-(step / 2), (step / 100).max(1));
+        self.vid_pts_us = self.vid_pts_us.saturating_add((step + corr).max(1) as u64);
+        self.last_vid_pts_us = Some(pts);
         pts
     }
 
@@ -618,11 +670,15 @@ impl MediaClock {
     /// the video timeline is the anchor, NOT the wall clock. Anchoring to
     /// arrival time instead puts audio permanently one frame duration late
     /// and turns every lost packet into accumulated error.
-    fn next_audio(&mut self, duration_us: u64, name: &str) -> u64 {
+    ///
+    /// Returns None until the first video frame, since there is nothing to
+    /// anchor to yet. Like video, audio PTS only ever moves forward.
+    fn next_audio(&mut self, duration_us: u64, name: &str) -> Option<u64> {
+        let last_vid_pts_us = self.last_vid_pts_us?;
         // The frame that has just arrived covers roughly
         // [anchor - duration, anchor] on the video timeline, because the
         // encoder could not emit it until the last of its samples existed.
-        let anchor = (self.vid_pts_us as i64)
+        let anchor = (last_vid_pts_us as i64)
             .saturating_sub(duration_us as i64)
             .saturating_sub(self.aud_lead_us)
             .max(0);
@@ -634,7 +690,7 @@ impl MediaClock {
 
         let err = self.aud_pts_us as i64 - anchor;
 
-        if err.abs() > Self::AUD_RESYNC_US {
+        if err < -Self::AUD_RESYNC_US {
             // Audio frames went missing, so there is a real gap here. Jumping
             // to the anchor renders it as the short silence it actually is.
             // Slewing instead would compress the surviving audio and hold the
@@ -647,19 +703,20 @@ impl MediaClock {
             self.aud_pts_us = anchor as u64;
             let pts = self.aud_pts_us;
             self.aud_pts_us = self.aud_pts_us.saturating_add(duration_us);
-            return pts;
+            return Some(pts);
         }
 
-        // Small residual drift between the accumulated audio duration and the
-        // video timeline gets slewed out, capped at 0.1% of frame duration so
-        // frame spacing stays even and resyncs stay rare.
-        let max_corr = (duration_us / 1000).max(1) as i64;
+        // Otherwise stay contiguous and slew out the residual. Audio ahead of
+        // the anchor is normal when frames arrive a few at a time, so it is
+        // never jumped back. The cap of 1/8 of a frame keeps every PTS after
+        // the one before it.
+        let max_corr = (duration_us / 8).max(1) as i64;
         let corr = (-err / 64).clamp(-max_corr, max_corr);
         let pts = self.aud_pts_us;
         self.aud_pts_us = self
             .aud_pts_us
             .saturating_add((duration_us as i64 + corr).max(1) as u64);
-        pts
+        Some(pts)
     }
 }
 
@@ -768,23 +825,25 @@ fn send_to_sources(
     match data {
         BcMedia::Aac(aac) => {
             let duration = aac.duration().expect("Could not calculate AAC duration");
-            let pts = clock.next_audio(duration as u64, &stats.name);
-            if let Some(aud_src) = aud_src.as_ref() {
-                log::debug!("Sending AAC: {:?}", Duration::from_micros(pts));
-                send_to_appsrc(aud_src, aac.data, Duration::from_micros(pts))?;
+            if let Some(pts) = clock.next_audio(duration as u64, &stats.name) {
+                if let Some(aud_src) = aud_src.as_ref() {
+                    log::debug!("Sending AAC: {:?}", Duration::from_micros(pts));
+                    send_to_appsrc(aud_src, aac.data, Duration::from_micros(pts))?;
+                }
+                stats.note_audio(pts, duration as u64);
             }
-            stats.note_audio(pts, duration as u64);
         }
         BcMedia::Adpcm(adpcm) => {
             let duration = adpcm
                 .duration()
                 .expect("Could not calculate ADPCM duration");
-            let pts = clock.next_audio(duration as u64, &stats.name);
-            if let Some(aud_src) = aud_src.as_ref() {
-                log::trace!("Sending ADPCM: {:?}", Duration::from_micros(pts));
-                send_to_appsrc(aud_src, adpcm.data, Duration::from_micros(pts))?;
+            if let Some(pts) = clock.next_audio(duration as u64, &stats.name) {
+                if let Some(aud_src) = aud_src.as_ref() {
+                    log::trace!("Sending ADPCM: {:?}", Duration::from_micros(pts));
+                    send_to_appsrc(aud_src, adpcm.data, Duration::from_micros(pts))?;
+                }
+                stats.note_audio(pts, duration as u64);
             }
-            stats.note_audio(pts, duration as u64);
         }
         BcMedia::Iframe(BcMediaIframe {
             data, microseconds, ..
@@ -792,7 +851,7 @@ fn send_to_sources(
         | BcMedia::Pframe(BcMediaPframe {
             data, microseconds, ..
         }) => {
-            let pts = clock.next_video(&stats.name);
+            let pts = clock.next_video(microseconds, &stats.name);
             if let Some(vid_src) = vid_src.as_ref() {
                 // A P-frame after a missing frame decodes against the wrong
                 // reference and smears until the next keyframe, so wait for
@@ -1437,4 +1496,147 @@ fn make_queue(name: &str, buffer_size: u32) -> AnyResult<Element> {
 fn buffer_size(bitrate: u32) -> u32 {
     // 0.1 seconds (according to bitrate) or 4kb what ever is larger
     std::cmp::max(bitrate * 2 / 8u32, 4u32 * 1024u32)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MediaClock;
+
+    const AAC_US: u64 = 64_000;
+
+    enum Ev {
+        /// A video frame with its camera timestamp.
+        Video(u32),
+        Audio,
+    }
+
+    #[derive(Default)]
+    struct Run {
+        vid_back: u32,
+        aud_back: u32,
+        vid_snaps: u64,
+        aud_snaps: u64,
+    }
+
+    /// Feeds `(wall_us, event)` pairs, in arrival order, through a clock
+    /// that nominally runs at 15 fps and counts PTS that fail to increase.
+    fn run(mut events: Vec<(i64, Ev)>) -> Run {
+        events.sort_by_key(|(wall, _)| *wall);
+        let mut clock = MediaClock::new(15);
+        clock.aud_lead_us = 0;
+        let mut out = Run::default();
+        let (mut last_vid, mut last_aud) = (None, None);
+        for (wall, ev) in events {
+            match ev {
+                Ev::Video(cam_us) => {
+                    let pts = clock.next_video_at(wall, cam_us, "test");
+                    if last_vid.is_some_and(|last| pts <= last) {
+                        out.vid_back += 1;
+                    }
+                    last_vid = Some(pts);
+                }
+                Ev::Audio => {
+                    if let Some(pts) = clock.next_audio(AAC_US, "test") {
+                        if last_aud.is_some_and(|last| pts <= last) {
+                            out.aud_back += 1;
+                        }
+                        last_aud = Some(pts);
+                    }
+                }
+            }
+        }
+        out.vid_snaps = clock.vid_snaps;
+        out.aud_snaps = clock.aud_snaps;
+        out
+    }
+
+    /// Video frames every `interval_us` over `[from_us, to_us)`, each
+    /// arriving as soon as the camera stamps it.
+    fn video(from_us: i64, to_us: i64, interval_us: i64) -> Vec<(i64, Ev)> {
+        (0..)
+            .map(|i| from_us + i * interval_us)
+            .take_while(|t| *t < to_us)
+            .map(|t| (t, Ev::Video(t as u32)))
+            .collect()
+    }
+
+    /// Audio frames back to back over `(0, to_us)`, each arriving as its
+    /// last sample is captured.
+    fn audio(to_us: i64) -> Vec<(i64, Ev)> {
+        (1..to_us / AAC_US as i64)
+            .map(|i| (i * AAC_US as i64, Ev::Audio))
+            .collect()
+    }
+
+    #[test]
+    fn stall_then_burst_never_steps_back() {
+        let step = 1_000_000 / 15;
+        // 10 s steady, a 2 s stall, the 30 held frames in 100 ms, then 60 s
+        // steady. Audio stalls with video and arrives in the same burst.
+        let mut events = video(0, 10_000_000, step);
+        // The camera kept stamping frames through the stall.
+        events.extend((0..30).map(|i| {
+            let cam_us = 10_000_000 + i * step;
+            (12_000_000 + i * 100_000 / 30, Ev::Video(cam_us as u32))
+        }));
+        events.extend(video(12_100_000, 72_100_000, step));
+        for i in 0..(72_000_000 / AAC_US as i64) {
+            let t = (i + 1) * AAC_US as i64;
+            let t = if (10_000_000..12_000_000).contains(&t) {
+                12_000_000 + (t - 10_000_000) / 20
+            } else {
+                t
+            };
+            events.push((t, Ev::Audio));
+        }
+        let r = run(events);
+        assert_eq!(r.vid_back, 0);
+        assert_eq!(r.aud_back, 0);
+        assert!(r.vid_snaps <= 2, "{} video snaps", r.vid_snaps);
+    }
+
+    #[test]
+    fn bursty_audio_stays_locked() {
+        // Audio arrives three 64 ms frames at a time every 192 ms.
+        let mut events = video(0, 60_000_000, 1_000_000 / 15);
+        for burst in 1..(60_000_000 / 192_000) {
+            events.extend((0..3).map(|_| (burst * 192_000, Ev::Audio)));
+        }
+        let r = run(events);
+        assert_eq!(r.vid_back, 0);
+        assert_eq!(r.aud_back, 0);
+        assert!(r.aud_snaps <= 5, "{} audio resyncs in 60 s", r.aud_snaps);
+    }
+
+    #[test]
+    fn jittery_audio_stays_locked() {
+        // Audio arrival jitters by up to +/-30 ms around its nominal time.
+        let mut events = video(0, 60_000_000, 1_000_000 / 15);
+        let mut seed: u64 = 0x2545_f491_4f6c_dd1d;
+        for i in 1..(60_000_000 / AAC_US as i64) {
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let jitter = ((seed >> 33) % 60_001) as i64 - 30_000;
+            events.push((i * AAC_US as i64 + jitter, Ev::Audio));
+        }
+        let r = run(events);
+        assert_eq!(r.vid_back, 0);
+        assert_eq!(r.aud_back, 0);
+        assert!(r.aud_snaps <= 5, "{} audio resyncs in 60 s", r.aud_snaps);
+    }
+
+    #[test]
+    fn slow_camera_follows_its_own_timestamps() {
+        // The camera is configured for 15 fps but delivers fewer.
+        for real_fps in [8, 10, 12, 14] {
+            let mut events = video(0, 60_000_000, 1_000_000 / real_fps);
+            events.extend(audio(60_000_000));
+            let r = run(events);
+            assert_eq!(r.vid_back, 0, "{real_fps} fps");
+            assert_eq!(r.aud_back, 0, "{real_fps} fps");
+            assert_eq!(r.vid_snaps, 0, "{real_fps} fps");
+            assert!(r.aud_snaps <= 2, "{real_fps} fps: {} resyncs", r.aud_snaps);
+        }
+    }
 }
