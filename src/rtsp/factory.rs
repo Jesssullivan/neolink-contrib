@@ -172,6 +172,42 @@ const RESUBSCRIBE_BACKOFF_MAX: Duration = Duration::from_secs(10);
 /// whether its client is still there while the camera is unreachable.
 const RESUBSCRIBE_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// How long a frame pusher waits for its pipeline to go live. gst-rtsp-server
+/// prepares the media right after the factory returns it, so a pipeline
+/// still NULL after this was never used, for example because its client gave
+/// up just as the pipeline was handed over.
+const PIPELINE_LIVE_DEADLINE: Duration = Duration::from_secs(30);
+
+/// Decides from its pipeline's state whether a frame pusher keeps going.
+struct PipelineWatch {
+    started: std::time::Instant,
+    was_live: bool,
+}
+
+impl PipelineWatch {
+    fn new(now: std::time::Instant) -> Self {
+        Self {
+            started: now,
+            was_live: false,
+        }
+    }
+
+    /// False once the pusher should stop: its pipeline was live and has gone
+    /// back to NULL, or it never went live within `PIPELINE_LIVE_DEADLINE`.
+    /// The pipeline is still NULL while gst-rtsp-server prepares it, so NULL
+    /// alone does not mean gone.
+    fn keep_going(&mut self, alive: bool, now: std::time::Instant) -> bool {
+        if alive {
+            self.was_live = true;
+            true
+        } else if self.was_live {
+            false
+        } else {
+            now.saturating_duration_since(self.started) < PIPELINE_LIVE_DEADLINE
+        }
+    }
+}
+
 /// True while an appsrc is still attached to a live pipeline.
 fn source_alive(src: &AppSrc) -> bool {
     let element: &Element = src.upcast_ref();
@@ -378,10 +414,7 @@ pub(super) async fn make_factory(
 
                             log::trace!("{name}::{stream}: Sending new frames");
                             let mut backoff = RESUBSCRIBE_BACKOFF_MIN;
-                            // The pipeline is still NULL while gst-rtsp-server
-                            // prepares it, so only a pipeline that has been
-                            // live and then went back to NULL counts as gone.
-                            let mut was_live = false;
+                            let mut watch = PipelineWatch::new(std::time::Instant::now());
                             'frames: loop {
                                 // Bounded wait so that a client that has gone
                                 // away is noticed even if the camera has also
@@ -477,10 +510,13 @@ pub(super) async fn make_factory(
                                 // rather than only when the camera goes idle.
                                 // Otherwise this thread keeps the camera
                                 // stream open for a pipeline nobody plays.
-                                if sources_alive(&vid_src, &aud_src) {
-                                    was_live = true;
-                                } else if was_live {
-                                    log::debug!("{name}::{stream}: Pipeline gone; stopping");
+                                if !watch.keep_going(
+                                    sources_alive(&vid_src, &aud_src),
+                                    std::time::Instant::now(),
+                                ) {
+                                    log::debug!(
+                                        "{name}::{stream}: Pipeline gone or never went live; stopping"
+                                    );
                                     break;
                                 }
                             }
@@ -1479,6 +1515,39 @@ fn make_queue(name: &str, buffer_size: u32) -> AnyResult<Element> {
 fn buffer_size(bitrate: u32) -> u32 {
     // 0.1 seconds (according to bitrate) or 4kb what ever is larger
     std::cmp::max(bitrate * 2 / 8u32, 4u32 * 1024u32)
+}
+
+#[cfg(test)]
+mod watch_tests {
+    use super::{PipelineWatch, PIPELINE_LIVE_DEADLINE};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn waits_for_the_pipeline_to_go_live() {
+        let t0 = Instant::now();
+        let mut watch = PipelineWatch::new(t0);
+        assert!(watch.keep_going(false, t0 + Duration::from_secs(1)));
+        assert!(watch.keep_going(true, t0 + Duration::from_secs(2)));
+        // Once live, the deadline no longer applies.
+        assert!(watch.keep_going(true, t0 + PIPELINE_LIVE_DEADLINE * 10));
+    }
+
+    #[test]
+    fn stops_when_a_live_pipeline_goes() {
+        let t0 = Instant::now();
+        let mut watch = PipelineWatch::new(t0);
+        assert!(watch.keep_going(true, t0));
+        assert!(!watch.keep_going(false, t0 + Duration::from_millis(100)));
+    }
+
+    #[test]
+    fn stops_when_the_pipeline_never_goes_live() {
+        let t0 = Instant::now();
+        let mut watch = PipelineWatch::new(t0);
+        let just_before = t0 + PIPELINE_LIVE_DEADLINE - Duration::from_millis(1);
+        assert!(watch.keep_going(false, just_before));
+        assert!(!watch.keep_going(false, t0 + PIPELINE_LIVE_DEADLINE));
+    }
 }
 
 #[cfg(test)]
