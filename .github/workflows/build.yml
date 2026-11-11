@@ -28,10 +28,15 @@ jobs:
     if: needs.pre_job.outputs.should_skip != 'true'
     name: native
     runs-on: ${{ matrix.os }}
+    # TIN-8227: the Windows and macOS native builds may fail without failing
+    # the run. The estate-test workflow is the gate. macos-12 is gone from the
+    # matrix because GitHub retired that runner image and the job stayed
+    # pending until the 24 hour limit.
+    continue-on-error: ${{ matrix.os == 'windows-2022' || matrix.os == 'macos-14' }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-22.04, windows-2022, macos-12, macos-14] # macos-14+ is arm64
+        os: [ubuntu-22.04, windows-2022, macos-14] # macos-14+ is arm64
     steps:
       - uses: actions/checkout@v4
         name: Checkout onto ${{ runner.os }}
@@ -363,11 +368,6 @@ jobs:
         with:
           name: release-windows-2022
           path: neolink_windows
-      - name: Download Macos
-        uses: actions/download-artifact@v4
-        with:
-          name: release-macos-12
-          path: neolink_macos_intel
       - name: Download Macos arm64
         uses: actions/download-artifact@v4
         with:
@@ -402,7 +402,6 @@ jobs:
         run: |
           dirs=(
             neolink_windows
-            neolink_macos_intel
             neolink_macos_m1
             neolink_linux_x86_64_ubuntu
             neolink_linux_x86_64_bookworm
@@ -415,12 +414,11 @@ jobs:
             zip -r "${d}.zip" "${d}"
           done
       - name: release
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v2 # TIN-8227: v1 runs on a retired Node runtime
         with:
           name: Neolink ${{steps.toml.outputs.version}}
           files: |
             neolink_windows.zip
-            neolink_macos_intel.zip
             neolink_macos_m1.zip
             neolink_linux_x86_64_ubuntu.zip
             neolink_linux_x86_64_bookworm.zip
