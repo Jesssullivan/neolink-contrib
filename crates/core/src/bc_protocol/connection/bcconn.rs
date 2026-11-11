@@ -51,6 +51,8 @@ impl BcConnection {
             subscribers: Default::default(),
             sink: sinker.clone(),
             reciever: ReceiverStream::new(poll_commanded),
+            #[cfg(test)]
+            runs: 0,
         };
 
         let mut rx_thread = JoinSet::<Result<()>>::new();
@@ -89,14 +91,7 @@ impl BcConnection {
         rx_thread.spawn(async move {
             tokio::select! {
                 _ = thread_cancel.cancelled() => Result::Ok(()),
-                v = async {
-                    loop {
-                        if let n @ Err(_) = poller.run().await {
-                            trace!("Polling has ended");
-                            return n;
-                        }
-                    }
-                }=> v
+                v = poller.supervise() => v,
             }
         });
 
@@ -226,10 +221,29 @@ struct Poller {
     subscribers: Subscriber,
     sink: Sender<Result<Bc>>,
     reciever: ReceiverStream<PollCommand>,
+    /// How many times `run` was entered, for the clean close tests.
+    #[cfg(test)]
+    runs: usize,
 }
 
 impl Poller {
+    /// Runs the poller once and returns its result.
+    ///
+    /// `run` returns `Ok` when every command sender is gone and `Err` on the
+    /// first error. Either way polling is over. Calling `run` again on a
+    /// closed channel would return at once and spin until the cancel token
+    /// fires, so the poller is run only once.
+    async fn supervise(&mut self) -> Result<()> {
+        let result = self.run().await;
+        trace!("Polling has ended");
+        result
+    }
+
     async fn run(&mut self) -> Result<()> {
+        #[cfg(test)]
+        {
+            self.runs += 1;
+        }
         let cancel = CancellationToken::new();
         let _dropguard = cancel.clone().drop_guard();
         while let Some(command) = self.reciever.next().await {
@@ -401,5 +415,98 @@ impl Poller {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+    use tokio::sync::mpsc::Receiver;
+    use tokio::time::timeout;
+
+    /// A poller with its command sender and the receiving end of its sink.
+    fn test_poller() -> (Poller, Sender<PollCommand>, Receiver<Result<Bc>>) {
+        let (sink, sink_rx) = channel(100);
+        let (commander, commanded) = channel(200);
+        let poller = Poller {
+            subscribers: Default::default(),
+            sink,
+            reciever: ReceiverStream::new(commanded),
+            runs: 0,
+        };
+        (poller, commander, sink_rx)
+    }
+
+    /// P-111: a closed command channel ends the poller after one run, with no
+    /// cancel token involved.
+    #[tokio::test]
+    async fn poller_stops_on_clean_close() {
+        let (mut poller, commander, _sink_rx) = test_poller();
+        drop(commander);
+
+        let ended = timeout(Duration::from_millis(50), poller.supervise()).await;
+
+        assert!(
+            matches!(ended, Ok(Ok(()))),
+            "the poller did not end on a clean close: {:?}",
+            ended
+        );
+        assert_eq!(poller.runs, 1, "run was entered more than once");
+    }
+
+    /// P-111: the task that drives the poller is gone within 2 seconds of a
+    /// clean close, so no live task is left behind.
+    #[tokio::test]
+    async fn poller_task_ends_on_clean_close() {
+        let (mut poller, commander, _sink_rx) = test_poller();
+        let task = tokio::spawn(async move {
+            let result = poller.supervise().await;
+            (result, poller.runs)
+        });
+        drop(commander);
+
+        let joined = timeout(Duration::from_secs(2), task).await;
+
+        match joined {
+            Ok(Ok((Ok(()), runs))) => assert_eq!(runs, 1, "run was entered more than once"),
+            other => panic!(
+                "the poller task was still alive after a clean close: {:?}",
+                other
+            ),
+        }
+    }
+
+    /// A decode error still ends the poller with that error, and subscribers
+    /// hear about it, while the command sender stays open.
+    #[tokio::test]
+    async fn poller_still_ends_on_error() {
+        let (mut poller, commander, _sink_rx) = test_poller();
+        let (sub_tx, mut sub_rx) = channel(10);
+        commander
+            .send(PollCommand::AddSubscriber(1, Some(1), sub_tx))
+            .await
+            .expect("poller command channel open");
+        commander
+            .send(PollCommand::Bc(Box::new(Err(Error::NomError(
+                "bad header".to_string(),
+            )))))
+            .await
+            .expect("poller command channel open");
+
+        let ended = timeout(Duration::from_millis(50), poller.supervise()).await;
+
+        assert!(
+            matches!(ended, Ok(Err(Error::NomError(_)))),
+            "the poller did not end with the decode error: {:?}",
+            ended
+        );
+        assert_eq!(poller.runs, 1, "run was entered more than once");
+        assert!(
+            matches!(sub_rx.recv().await, Some(Err(Error::NomError(_)))),
+            "the subscriber did not receive the decode error"
+        );
+        // The sender lives until here, so the end above came from the error.
+        drop(commander);
     }
 }
