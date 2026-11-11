@@ -1,0 +1,96 @@
+# Estate test job (TIN-8227). It runs the workspace tests with the GStreamer
+# plugins the RTSP and audio code needs, on the Debian-family runner that is
+# closest to the field VM. This job, not the older build matrix, is the gate a
+# change must pass before it merges or before a receiver pins its rev.
+name: Estate test
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: estate-test-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Proposal: the toolchain the cross jobs of build.yml already build with.
+  rust_version: "1.82.0"
+  CARGO_TERM_COLOR: never
+
+jobs:
+  estate-test:
+    name: estate-test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: apt install GStreamer and build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libgstrtspserver-1.0-dev \
+            libgstreamer1.0-dev \
+            libgstreamer-plugins-base1.0-dev \
+            gstreamer1.0-plugins-base \
+            gstreamer1.0-plugins-good \
+            gstreamer1.0-plugins-bad \
+            gstreamer1.0-libav \
+            gstreamer1.0-tools \
+            protobuf-compiler \
+            python3-yaml
+
+      - name: Estate CI self-test
+        run: python3 -m unittest discover -s .github/estate-test -p 'test_*.py' -v
+
+      - name: GStreamer elements
+        run: bash .github/estate-test/check_gst_elements.sh voaacenc faad aacparse rtpmp4gpay
+
+      - name: Install Rust ${{ env.rust_version }}
+        run: |
+          rustup toolchain install "${rust_version}" --profile minimal
+          rustup default "${rust_version}"
+          rustc --version
+          cargo --version
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: estate-test-${{ runner.os }}-${{ env.rust_version }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            estate-test-${{ runner.os }}-${{ env.rust_version }}-
+
+      - name: cargo test
+        shell: bash
+        run: |
+          cargo test --workspace --locked 2>&1 | tee cargo-test.log
+
+      - name: estate_test_job_runs_core_tests
+        if: ${{ !cancelled() }}
+        run: python3 .github/estate-test/cargo_test_summary.py cargo-test.log --require neolink_core --min 1
+
+  actionlint:
+    name: actionlint
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install actionlint
+        run: |
+          bash <(curl -fsSL https://raw.githubusercontent.com/rhysd/actionlint/v1.7.12/scripts/download-actionlint.bash) 1.7.12
+      - name: actionlint estate-test.yml
+        run: ./actionlint -color .github/workflows/estate-test.yml
+      - name: actionlint build.yml
+        # The shell bodies of build.yml predate the estate and carry shellcheck
+        # findings outside TIN-8227, so this run checks workflow syntax,
+        # expressions, runner labels and action inputs only.
+        run: ./actionlint -color -shellcheck= .github/workflows/build.yml
