@@ -13,9 +13,12 @@ on:
 permissions:
   contents: read
 
+# A newer push to a pull request cancels its older run. A push to master never
+# cancels, so every master commit keeps its own estate-test result and can be
+# chosen as a receiver pin.
 concurrency:
   group: estate-test-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   # Proposal: the toolchain the cross jobs of build.yml already build with.

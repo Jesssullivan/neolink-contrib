@@ -265,6 +265,41 @@ class GstElementCheck(unittest.TestCase):
         self.assertEqual(self.run_check([], []).returncode, 2)
 
 
+# Every step whose exit status decides whether estate-test passes, with the exact
+# keys it may carry. A run is compared after collapsing whitespace, so only
+# layout may change. An exact match, not a deny list, is what stops a later
+# edit from appending `|| true`, `|| :`, a `set +` line or a narrowing flag.
+GATING_STEPS = {
+    ("estate-test", "Estate CI self-test"): {
+        "run": "python3 -m unittest discover -s .github/estate-test -p 'test_*.py' -v",
+    },
+    ("estate-test", "GStreamer elements"): {
+        "run": "bash .github/estate-test/check_gst_elements.sh voaacenc faad aacparse rtpmp4gpay",
+    },
+    ("estate-test", "cargo test"): {
+        # An explicit bash shell runs with -o pipefail, so tee cannot hide a cargo failure.
+        "shell": "bash",
+        "run": "cargo test --workspace --locked 2>&1 | tee cargo-test.log",
+    },
+    ("estate-test", "estate_test_job_runs_core_tests"): {
+        # Runs after a failed cargo step too, so the summary table is written.
+        "if": "${{ !cancelled() }}",
+        "run": "python3 .github/estate-test/cargo_test_summary.py cargo-test.log "
+               "--require neolink_core --min 1",
+    },
+    ("actionlint", "actionlint estate-test.yml"): {
+        "run": "./actionlint -color .github/workflows/estate-test.yml",
+    },
+    ("actionlint", "actionlint build.yml"): {
+        "run": "./actionlint -color -shellcheck= .github/workflows/build.yml",
+    },
+}
+
+
+def squash(text: str) -> str:
+    return " ".join(str(text).split())
+
+
 class EstateTestWorkflow(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -272,20 +307,54 @@ class EstateTestWorkflow(unittest.TestCase):
         cls.job = cls.wf["jobs"]["estate-test"]
 
     def test_triggers(self):
-        """Guard G1: runs on every pull request and on push to master."""
+        """Guard G1: runs on every pull request and on push to master, with no filter."""
         on = triggers(self.wf)
-        self.assertIn("pull_request", on)
-        pr = on["pull_request"] or {}
-        self.assertNotIn("branches", pr)
-        self.assertNotIn("paths", pr)
-        self.assertEqual(on["push"]["branches"], ["master"])
+        self.assertEqual(set(on), {"pull_request", "push", "workflow_dispatch"})
+        # Any key under pull_request (branches, paths, paths-ignore, types and the
+        # rest) narrows which pull requests run the job.
+        self.assertIn(on["pull_request"], (None, {}))
+        self.assertEqual(on["push"], {"branches": ["master"]})
+        self.assertIn(on["workflow_dispatch"], (None, {}))
+
+    def test_jobs_are_never_skipped(self):
+        """Guard G1: GitHub counts a skipped job as a passed required check, so no job has an if."""
+        for name, job in self.wf["jobs"].items():
+            self.assertNotIn("if", job, name)
+            self.assertNotIn("needs", job, name)
+
+    def test_concurrency_never_cancels_master(self):
+        """Guard G11: a newer push cancels an older pull request run, never a master run."""
+        self.assertEqual(
+            self.wf["concurrency"],
+            {
+                "group": "estate-test-${{ github.ref }}",
+                "cancel-in-progress": "${{ github.event_name == 'pull_request' }}",
+            },
+        )
 
     def test_runner_and_timeout(self):
         """Guard G2: one job on ubuntu-24.04 with a 45 minute limit."""
         self.assertEqual(self.job["name"], "estate-test")
         self.assertEqual(self.job["runs-on"], "ubuntu-24.04")
         self.assertEqual(self.job["timeout-minutes"], 45)
-        self.assertNotIn("continue-on-error", self.job)
+        for name, job in self.wf["jobs"].items():
+            self.assertNotIn("continue-on-error", job, name)
+            # A defaults block could swap the shell of every step for one without -e.
+            self.assertNotIn("defaults", job, name)
+        self.assertNotIn("defaults", self.wf)
+
+    def test_gating_steps_are_exact_and_fatal(self):
+        """Guards G2, G4, G5, G6, G9 and G10: each gating step runs its exact command and can fail the job."""
+        for (job_name, step_name), expected in GATING_STEPS.items():
+            with self.subTest(job=job_name, step=step_name):
+                step = job_step(self.wf["jobs"][job_name], step_name)
+                self.assertEqual(set(step), {"name", *expected})
+                run = squash(step["run"])
+                self.assertEqual(run, squash(expected["run"]))
+                self.assertNotIn("||", run)
+                self.assertNotIn("set +", run)
+                for key in set(expected) - {"run"}:
+                    self.assertEqual(step[key], expected[key])
 
     def test_apt_packages(self):
         """Guard G3: the apt step installs every package the spec lists."""
@@ -294,49 +363,27 @@ class EstateTestWorkflow(unittest.TestCase):
         self.assertEqual(missing, [])
         self.assertIn("gstreamer1.0-tools", words)  # gst-inspect-1.0
 
-    def test_cargo_test_command(self):
-        """Guard G4: the workspace tests run locked, with default features, and a failure fails the step."""
-        step = job_step(self.job, "cargo test")
-        run = step["run"]
-        self.assertIn("cargo test --workspace --locked", run)
-        for flag in ("--no-default-features", "--exclude", "--features", "--no-fail-fast", "|| true"):
-            self.assertNotIn(flag, run)
-        # An explicit bash shell runs with -o pipefail, so tee cannot hide a cargo failure.
-        self.assertEqual(step.get("shell"), "bash")
-        self.assertNotIn("continue-on-error", step)
+    def test_cargo_test_default_features(self):
+        """Guard G4: the default features the cargo step builds with include gstreamer."""
         with open(ROOT / "Cargo.toml", "rb") as fh:
             default = tomllib.load(fh)["features"]["default"]
         self.assertIn("gstreamer", default)
 
-    def test_core_test_check_runs_after_cargo(self):
-        """Guard G6: the summary check reads the cargo log and requires neolink_core."""
-        i = step_index(self.job, "cargo test")
-        j = step_index(self.job, "estate_test_job_runs_core_tests")
-        self.assertGreater(j, i)
-        step = self.job["steps"][j]
-        self.assertIn("cargo_test_summary.py cargo-test.log", step["run"])
-        self.assertIn("--require neolink_core", step["run"])
-        self.assertIn("tee cargo-test.log", self.job["steps"][i]["run"])
-        self.assertNotIn("continue-on-error", step)
+    def test_step_order(self):
+        """Guards G6 and G10: self-test and element check before cargo, the summary check after it."""
+        order = [step_index(self.job, n) for n in (
+            "Estate CI self-test",
+            "GStreamer elements",
+            "cargo test",
+            "estate_test_job_runs_core_tests",
+        )]
+        self.assertEqual(order, sorted(order))
 
-    def test_gst_elements_step(self):
+    def test_gst_elements_named(self):
         """Guard G5: the element check names every element the audio work needs."""
         run = job_step(self.job, "GStreamer elements")["run"]
-        self.assertIn("check_gst_elements.sh", run)
         for e in REQUIRED_ELEMENTS:
             self.assertIn(e, run.split())
-
-    def test_self_test_runs_before_cargo(self):
-        """Guard G10: these tests run in the job, before the long cargo step."""
-        i = step_index(self.job, "Estate CI self-test")
-        self.assertIn("unittest discover -s .github/estate-test", self.job["steps"][i]["run"])
-        self.assertLess(i, step_index(self.job, "cargo test"))
-
-    def test_actionlint_covers_both_workflows(self):
-        """Guard G9: actionlint checks estate-test.yml and build.yml."""
-        runs = " ".join(s.get("run", "") for s in self.wf["jobs"]["actionlint"]["steps"])
-        self.assertIn("actionlint -color .github/workflows/estate-test.yml", runs)
-        self.assertIn(".github/workflows/build.yml", runs)
 
 
 class BuildWorkflow(unittest.TestCase):
