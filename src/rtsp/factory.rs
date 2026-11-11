@@ -1691,4 +1691,192 @@ mod tests {
             assert!(r.aud_snaps <= 2, "{real_fps} fps: {} resyncs", r.aud_snaps);
         }
     }
+
+    const STEP_US: i64 = 1_000_000 / 15;
+
+    /// Feeds video frames, as `(wall_us, cam_us)` in arrival order, through
+    /// `clock` and returns each PTS with its wall time.
+    fn video_pts(clock: &mut MediaClock, frames: &[(i64, u32)]) -> Vec<(i64, u64)> {
+        frames
+            .iter()
+            .map(|&(wall, cam_us)| (wall, clock.next_video_at(wall, cam_us, "test")))
+            .collect()
+    }
+
+    fn assert_increasing(pts: &[(i64, u64)]) {
+        for pair in pts.windows(2) {
+            assert!(pair[1].1 > pair[0].1, "PTS stepped back: {:?}", pair);
+        }
+    }
+
+    /// Largest lead of PTS over wall time, in microseconds.
+    fn max_lead_us(pts: &[(i64, u64)]) -> i64 {
+        pts.iter()
+            .map(|&(wall, pts)| pts as i64 - wall)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// 15 fps frames `i` in `range`, arriving on time, stamped by `cam`.
+    fn steady(range: std::ops::Range<i64>, cam: impl Fn(i64) -> u32) -> Vec<(i64, u32)> {
+        range.map(|i| (i * STEP_US, cam(i))).collect()
+    }
+
+    #[test]
+    fn camera_timestamp_wrap_keeps_spacing() {
+        // The camera's u32 microsecond clock wraps every 71.6 minutes. Start
+        // 2 s before the wrap and run 60 s across it.
+        let start = u32::MAX - 2_000_000;
+        let frames = steady(0..900, |i| start.wrapping_add((i * STEP_US) as u32));
+        let mut clock = MediaClock::new(15);
+        let pts = video_pts(&mut clock, &frames);
+        assert_increasing(&pts);
+        assert_eq!(clock.vid_snaps, 0);
+        for pair in pts.windows(2) {
+            let delta = (pair[1].1 - pair[0].1) as i64;
+            assert!(
+                (delta - STEP_US).abs() <= STEP_US / 50,
+                "spacing {} us around {:?}",
+                delta,
+                pair
+            );
+        }
+    }
+
+    #[test]
+    fn camera_timestamp_reset_without_notice_is_bounded() {
+        // 30 s stamped from 50 s, then the camera restarts its clock at 0 on
+        // the same stream. The backward jump reads as a huge forward step,
+        // which the clamp limits to four frame intervals.
+        let frames = steady(0..1800, |i| {
+            if i < 900 {
+                (50_000_000 + i * STEP_US) as u32
+            } else {
+                ((i - 900) * STEP_US) as u32
+            }
+        });
+        let mut clock = MediaClock::new(15);
+        let pts = video_pts(&mut clock, &frames);
+        assert_increasing(&pts);
+        assert_eq!(clock.vid_snaps, 0);
+        assert!(
+            max_lead_us(&pts) <= 4 * STEP_US,
+            "lead {} us",
+            max_lead_us(&pts)
+        );
+        // The lead drains: 10 s later PTS is back within a frame of wall time.
+        let (wall, last) = *pts.last().unwrap();
+        assert!((last as i64 - wall).abs() < STEP_US);
+    }
+
+    #[test]
+    fn camera_restarted_spaces_the_next_frame_nominally() {
+        let mut clock = MediaClock::new(15);
+        let before = video_pts(
+            &mut clock,
+            &steady(0..150, |i| (80_000_000 + i * STEP_US) as u32),
+        );
+        clock.camera_restarted();
+        let after = video_pts(
+            &mut clock,
+            &steady(150..300, |i| ((i - 150) * STEP_US) as u32),
+        );
+        let joined: Vec<_> = before.iter().chain(after.iter()).copied().collect();
+        assert_increasing(&joined);
+        let first_gap = (after[0].1 - before.last().unwrap().1) as i64;
+        assert!(
+            (first_gap - STEP_US).abs() <= STEP_US / 50,
+            "gap {} us",
+            first_gap
+        );
+        assert!(max_lead_us(&joined) < STEP_US / 2);
+        assert_eq!(clock.vid_snaps, 0);
+    }
+
+    #[test]
+    fn fps_change_follows_the_new_rate() {
+        // 30 s at 15 fps, then the camera reports and delivers 25 fps.
+        let step25 = 1_000_000 / 25;
+        let mut clock = MediaClock::new(15);
+        let mut pts = video_pts(&mut clock, &steady(0..450, |i| (i * STEP_US) as u32));
+        clock.set_fps(25);
+        let switch = 450 * STEP_US;
+        let later: Vec<(i64, u32)> = (0..750)
+            .map(|i| (switch + i * step25, (switch + i * step25) as u32))
+            .collect();
+        pts.extend(video_pts(&mut clock, &later));
+        assert_increasing(&pts);
+        assert_eq!(clock.vid_snaps, 0);
+        let tail = &pts[pts.len() - 100..];
+        for pair in tail.windows(2) {
+            let delta = (pair[1].1 - pair[0].1) as i64;
+            assert!(
+                (delta - step25).abs() <= step25 / 50,
+                "spacing {} us",
+                delta
+            );
+        }
+        assert!(max_lead_us(&pts) < step25);
+    }
+
+    #[test]
+    fn zero_fps_does_not_divide_by_zero() {
+        let mut clock = MediaClock::new(0);
+        clock.set_fps(0);
+        let pts = video_pts(&mut clock, &[(0, 0), (1_000_000, 1_000_000)]);
+        assert_increasing(&pts);
+    }
+
+    #[test]
+    fn pts_lead_over_wall_is_bounded() {
+        // Steady camera timestamps, arrival jittered by up to +/-30 ms: PTS
+        // never leads the wall clock by more than the jitter plus a frame.
+        let mut seed: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut frames: Vec<(i64, u32)> = (0..900)
+            .map(|i| {
+                seed = seed
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                let jitter = ((seed >> 33) % 60_001) as i64 - 30_000;
+                ((i * STEP_US + jitter).max(0), (i * STEP_US) as u32)
+            })
+            .collect();
+        frames.sort_by_key(|f| f.0);
+        let mut clock = MediaClock::new(15);
+        let pts = video_pts(&mut clock, &frames);
+        assert_increasing(&pts);
+        assert!(
+            max_lead_us(&pts) <= 30_000 + STEP_US,
+            "lead {} us",
+            max_lead_us(&pts)
+        );
+
+        // After a 2 s stall the held frames arrive in a 100 ms burst. The
+        // lead is bounded by the camera time the burst covers, and drains.
+        let mut clock = MediaClock::new(15);
+        let mut frames = steady(0..150, |i| (i * STEP_US) as u32);
+        frames.extend((0..30).map(|i| {
+            (
+                12_000_000 + i * 100_000 / 30,
+                (10_000_000 + i * STEP_US) as u32,
+            )
+        }));
+        frames.extend((0..450).map(|i| {
+            let t = 12_100_000 + i * STEP_US;
+            (t, (12_000_000 + i * STEP_US) as u32)
+        }));
+        let pts = video_pts(&mut clock, &frames);
+        assert_increasing(&pts);
+        assert!(
+            max_lead_us(&pts) <= 30 * STEP_US,
+            "lead {} us",
+            max_lead_us(&pts)
+        );
+        let (wall, last) = *pts.last().unwrap();
+        assert!(
+            (last as i64 - wall).abs() < STEP_US,
+            "lead {} us after 30 s",
+            last as i64 - wall
+        );
+    }
 }
