@@ -67,6 +67,8 @@ use tokio_stream::wrappers::IntervalStream;
 use tokio_stream::StreamExt;
 use tokio_util::sync::CancellationToken;
 
+#[cfg(test)]
+mod audio_tests;
 mod cmdline;
 mod factory;
 mod gst;
@@ -76,7 +78,7 @@ use crate::common::{NeoInstance, NeoReactor};
 use factory::*;
 use stream::*;
 
-use super::config::UserConfig;
+use super::config::{AudioCodec, CameraConfig, StreamConfig, UserConfig};
 pub(crate) use cmdline::Opt;
 use gst::NeoRtspServer;
 
@@ -292,7 +294,8 @@ async fn camera_main(camera: NeoInstance, rtsp: &NeoRtspServer) -> Result<()> {
 
     let mut camera_config = camera.config().await?.clone();
     loop {
-        let prev_stream_config = camera_config.borrow_and_update().stream;
+        let restart_key = RestartKey::of(&camera_config.borrow_and_update());
+        let prev_stream_config = camera_config.borrow().stream;
         let prev_stream_users = camera_config.borrow().permitted_users.clone();
         let active_streams = prev_stream_config
             .as_stream_kinds()
@@ -303,7 +306,7 @@ async fn camera_main(camera: NeoInstance, rtsp: &NeoRtspServer) -> Result<()> {
 
         // This select is for changes to camera_config.stream
         break tokio::select! {
-            v = camera_config.wait_for(|config| config.stream != prev_stream_config || config.permitted_users != prev_stream_users || config.use_splash != use_splash) => {
+            v = camera_config.wait_for(|config| RestartKey::of(config) != restart_key) => {
                 if let Err(e) = v {
                     AnyResult::Err(e.into())
                 } else {
@@ -443,4 +446,69 @@ async fn camera_main(camera: NeoInstance, rtsp: &NeoRtspServer) -> Result<()> {
     }?;
 
     Ok(())
+}
+
+/// The camera settings that shape its RTSP mounts and pipelines. A change to
+/// any of them remounts the camera, so the next client gets a pipeline built
+/// from the new settings instead of a cached one.
+#[derive(Clone, Debug, PartialEq)]
+struct RestartKey {
+    stream: StreamConfig,
+    permitted_users: Option<Vec<String>>,
+    use_splash: bool,
+    audio_codec: AudioCodec,
+}
+
+impl RestartKey {
+    fn of(config: &CameraConfig) -> Self {
+        Self {
+            stream: config.stream,
+            permitted_users: config.permitted_users.clone(),
+            use_splash: config.use_splash,
+            audio_codec: config.audio_codec,
+        }
+    }
+}
+
+#[cfg(test)]
+mod restart_key_tests {
+    use super::{AudioCodec, CameraConfig, RestartKey, StreamConfig};
+
+    fn camera() -> CameraConfig {
+        let config: crate::config::Config = toml::from_str(
+            "[[cameras]]\nname = \"cam\"\nusername = \"admin\"\naddress = \"192.0.2.1:9000\"\n",
+        )
+        .unwrap();
+        config.cameras[0].clone()
+    }
+
+    #[test]
+    fn audio_codec_change_remounts() {
+        let before = camera();
+        let mut after = before.clone();
+        after.audio_codec = AudioCodec::Pcmu;
+        assert_ne!(RestartKey::of(&before), RestartKey::of(&after));
+    }
+
+    #[test]
+    fn earlier_restart_settings_still_remount() {
+        let before = camera();
+        let mut stream = before.clone();
+        stream.stream = StreamConfig::Sub;
+        let mut users = before.clone();
+        users.permitted_users = Some(vec!["me".to_string()]);
+        let mut splash = before.clone();
+        splash.use_splash = !before.use_splash;
+        for after in [stream, users, splash] {
+            assert_ne!(RestartKey::of(&before), RestartKey::of(&after));
+        }
+    }
+
+    #[test]
+    fn unrelated_change_does_not_remount() {
+        let before = camera();
+        let mut after = before.clone();
+        after.debug = !before.debug;
+        assert_eq!(RestartKey::of(&before), RestartKey::of(&after));
+    }
 }

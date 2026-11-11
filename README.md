@@ -29,6 +29,27 @@ Memoryleak that resulted in crashes after extended runtime of 24/7 streaming sho
 **Minor Features**:
 
 - Improved AV Sync, should now not have weird drift of sync of audio and video.
+- RTSP audio is served as AAC by default, set per camera with `audio_codec`.
+
+### RTSP audio codec
+
+Earlier releases decoded the camera's audio and served it as raw L16 PCM.
+ONVIF Profile T allows only AAC or G.711 mu-law for audio. Home Assistant
+keeps only AAC and MP3, and Frigate must transcode L16 before it can record.
+Each camera now takes an `audio_codec` key:
+
+| Value | RTSP track | Needs |
+|---|---|---|
+| `aac`, the default | AAC-LC mono, RTP `MPEG4-GENERIC` | `voaacenc` from gst-plugins-bad, or `avenc_aac` from gst-libav |
+| `pcmu` | G.711 mu-law, 8000 Hz mono, RTP `PCMU` | gst-plugins-good |
+| `l16` | raw 16 bit PCM, RTP `L16`, as before | gst-plugins-good |
+| `none` | no audio track | |
+
+AAC and ADPCM cameras both work in every mode. The audio is always encoded
+again. With `fallbackswitch` from gst-plugins-rs installed, an AAC camera's
+track falls back to silence in the chosen codec when the camera's audio stops.
+With `aac` and no AAC encoder installed, the stream is served with video only
+and the log names the missing plugin.
 
 ## Installation
 

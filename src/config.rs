@@ -218,6 +218,30 @@ pub(crate) struct CameraConfig {
 
     #[serde(default = "default_false", alias = "idle", alias = "idle_disc")]
     pub(crate) idle_disconnect: bool,
+
+    /// Codec of the RTSP audio track. The camera's AAC or ADPCM is decoded
+    /// and encoded again in this codec.
+    #[serde(default)]
+    pub(crate) audio_codec: AudioCodec,
+}
+
+/// Codec of the audio track that `neolink rtsp` serves.
+///
+/// The default is `aac`: ONVIF Profile T allows only AAC or G.711 mu-law for
+/// audio, and Home Assistant's stream component keeps only AAC and MP3.
+/// `l16` is the raw PCM track that earlier releases always served.
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, Eq, PartialEq, Default)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum AudioCodec {
+    /// AAC-LC, payloaded as RTP MPEG4-GENERIC.
+    #[default]
+    Aac,
+    /// G.711 mu-law at 8000 Hz mono, payloaded as RTP PCMU.
+    Pcmu,
+    /// Raw 16 bit PCM, payloaded as RTP L16.
+    L16,
+    /// No audio track.
+    None,
 }
 
 #[derive(Debug, Deserialize, Serialize, Validate, Clone, PartialEq, Eq, Hash)]
@@ -531,5 +555,48 @@ fn validate_camera_config(camera_config: &CameraConfig) -> Result<(), Validation
             "Either camera address or uid must be given",
         )),
         _ => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod audio_codec_tests {
+    use super::{AudioCodec, Config};
+
+    fn camera_with(extra: &str) -> Result<Config, toml::de::Error> {
+        toml::from_str(&format!(
+            "[[cameras]]\nname = \"cam\"\nusername = \"admin\"\naddress = \"192.0.2.1:9000\"\n{extra}\n"
+        ))
+    }
+
+    #[test]
+    fn config_default_is_aac() {
+        let config = camera_with("").unwrap();
+        assert_eq!(config.cameras[0].audio_codec, AudioCodec::Aac);
+    }
+
+    #[test]
+    fn config_reads_every_audio_codec() {
+        for (text, codec) in [
+            ("aac", AudioCodec::Aac),
+            ("pcmu", AudioCodec::Pcmu),
+            ("l16", AudioCodec::L16),
+            ("none", AudioCodec::None),
+        ] {
+            let config = camera_with(&format!("audio_codec = \"{text}\"")).unwrap();
+            assert_eq!(config.cameras[0].audio_codec, codec, "{text}");
+        }
+    }
+
+    #[test]
+    fn config_rejects_unknown_audio_codec() {
+        for bad in [
+            "audio_codec = \"opus\"",
+            "audio_codec = \"\"",
+            "audio_codec = \"AAC\"",
+            "audio_codec = 1",
+            "audio_codec = [\"aac\"]",
+        ] {
+            assert!(camera_with(bad).is_err(), "{} was accepted", bad);
+        }
     }
 }
