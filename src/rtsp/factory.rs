@@ -4,17 +4,19 @@ use std::time::Duration;
 use anyhow::{anyhow, Context, Result};
 use gstreamer::{prelude::*, Bin, Caps, Element, ElementFactory, FlowError, GhostPad};
 use gstreamer_app::{AppSrc, AppSrcCallbacks, AppStreamType};
-use gstreamer_rtsp_server::{prelude::*, RTSPMedia};
 use neolink_core::{
     bc_protocol::StreamKind,
     bcmedia::model::{
         BcMedia, BcMediaIframe, BcMediaInfoV1, BcMediaInfoV2, BcMediaPframe, VideoType,
     },
 };
-use std::sync::{Arc, Mutex, OnceLock};
 use tokio::{sync::mpsc::channel as mpsc, task::JoinHandle};
 
-use crate::{common::NeoInstance, rtsp::gst::NeoMediaFactory, AnyResult};
+use crate::{
+    common::NeoInstance,
+    rtsp::gst::{MediaKey, NeoMediaFactory},
+    AnyResult,
+};
 
 #[derive(Clone, Debug)]
 pub enum AudioType {
@@ -133,7 +135,7 @@ pub(super) async fn make_dummy_factory(
     use_splash: bool,
     pattern: String,
 ) -> AnyResult<NeoMediaFactory> {
-    NeoMediaFactory::new_with_callback(move |element| {
+    NeoMediaFactory::new_with_callback(move |element, _key| {
         clear_bin(&element)?;
         if !use_splash {
             Ok(None)
@@ -181,18 +183,16 @@ fn sources_alive(vid: &Option<AppSrc>, aud: &Option<AppSrc>) -> bool {
     vid.as_ref().is_some_and(source_alive) || aud.as_ref().is_some_and(source_alive)
 }
 
-/// The media that a pipeline ends up in. It is filled in by the factory's
-/// media-configure handler, which runs after the pipeline has been built.
-type MediaSlot = Arc<OnceLock<gstreamer::glib::WeakRef<RTSPMedia>>>;
-
 /// Runs when a frame pusher exits, however it exits. Nothing will feed this
-/// media again, so end its streams and stop handing it to new clients;
-/// otherwise the shared media stays cached and every later client joins a
-/// pipeline that never gets another frame.
+/// media again, so end its streams and retire its cache key; otherwise the
+/// shared media stays cached and every later client joins a pipeline that
+/// never gets another frame. Retiring the key works on every GStreamer
+/// version, unlike `set_shared(false)`, which the factory only consults from
+/// 1.24 on.
 struct PusherExit {
     vid_src: Option<AppSrc>,
     aud_src: Option<AppSrc>,
-    media: MediaSlot,
+    key: MediaKey,
 }
 
 impl Drop for PusherExit {
@@ -200,9 +200,7 @@ impl Drop for PusherExit {
         for src in self.vid_src.iter().chain(self.aud_src.iter()) {
             let _ = src.end_of_stream();
         }
-        if let Some(media) = self.media.get().and_then(|media| media.upgrade()) {
-            media.set_shared(false);
-        }
+        self.key.retire();
     }
 }
 
@@ -213,7 +211,7 @@ enum ClientMsg {
         /// waited on from the gst-rtsp-server client thread, which is not a
         /// tokio thread, and `recv_timeout` needs no runtime handle.
         reply: std::sync::mpsc::SyncSender<Element>,
-        media: MediaSlot,
+        key: MediaKey,
     },
 }
 
@@ -231,7 +229,7 @@ pub(super) async fn make_factory(
                 ClientMsg::NewClient {
                     element,
                     reply,
-                    media,
+                    key,
                 } => {
                     log::debug!("New client for {name}::{stream}");
                     let camera = camera.clone();
@@ -356,7 +354,7 @@ pub(super) async fn make_factory(
                             let _exit = PusherExit {
                                 vid_src: vid_src.clone(),
                                 aud_src: aud_src.clone(),
-                                media,
+                                key,
                             };
                             let mut clock = MediaClock::new(stream_config.fps);
                             let mut stats = TsStats::new(format!("{name}::{stream}"));
@@ -497,26 +495,16 @@ pub(super) async fn make_factory(
         AnyResult::Ok(())
     });
 
-    // gst-rtsp-server builds the element and then configures its media in one
-    // call, under the factory's media lock, so a single pending slot is enough
-    // to pair each pipeline with its media.
-    let pending_media: Arc<Mutex<Option<MediaSlot>>> = Default::default();
-    let callback_pending = pending_media.clone();
-
     // Now setup the factory
-    let factory = NeoMediaFactory::new_with_callback(move |element| {
+    let factory = NeoMediaFactory::new_with_callback(move |element, key| {
         let (reply, new_element) = std::sync::mpsc::sync_channel::<Element>(1);
-        let media = MediaSlot::default();
-        if let Ok(mut pending) = callback_pending.lock() {
-            pending.replace(media.clone());
-        }
         // try_send, not blocking_send: if the builder task is wedged we must
         // fail this client rather than block the shared client thread.
         client_tx
             .try_send(ClientMsg::NewClient {
                 element,
                 reply,
-                media,
+                key,
             })
             .map_err(|e| anyhow!("Pipeline builder is not accepting clients: {e}"))?;
 
@@ -532,11 +520,6 @@ pub(super) async fn make_factory(
         }
     })
     .await?;
-    factory.connect_media_configure(move |_, media| {
-        if let Some(slot) = pending_media.lock().ok().and_then(|mut p| p.take()) {
-            let _ = slot.set(media.downgrade());
-        }
-    });
     Ok((factory, thread))
 }
 
