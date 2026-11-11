@@ -12,7 +12,11 @@ use neolink_core::{
 };
 use tokio::{sync::mpsc::channel as mpsc, task::JoinHandle};
 
-use crate::{common::NeoInstance, rtsp::gst::NeoMediaFactory, AnyResult};
+use crate::{
+    common::NeoInstance,
+    rtsp::gst::{MediaKey, NeoMediaFactory},
+    AnyResult,
+};
 
 #[derive(Clone, Debug)]
 pub enum AudioType {
@@ -131,7 +135,7 @@ pub(super) async fn make_dummy_factory(
     use_splash: bool,
     pattern: String,
 ) -> AnyResult<NeoMediaFactory> {
-    NeoMediaFactory::new_with_callback(move |element| {
+    NeoMediaFactory::new_with_callback(move |element, _key| {
         clear_bin(&element)?;
         if !use_splash {
             Ok(None)
@@ -160,6 +164,50 @@ const STREAM_LEARN_TIMEOUT: Duration = Duration::from_secs(10);
 /// away without the camera sending another frame.
 const IDLE_CHECK_INTERVAL: Duration = Duration::from_secs(10);
 
+/// Backoff between attempts to resubscribe to the camera after its stream
+/// ends while a client is still watching. Doubles up to the max.
+const RESUBSCRIBE_BACKOFF_MIN: Duration = Duration::from_secs(1);
+const RESUBSCRIBE_BACKOFF_MAX: Duration = Duration::from_secs(10);
+/// Longest wait for one resubscribe attempt, so the pusher keeps checking
+/// whether its client is still there while the camera is unreachable.
+const RESUBSCRIBE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// How long a frame pusher waits for its pipeline to go live. gst-rtsp-server
+/// prepares the media right after the factory returns it, so a pipeline
+/// still NULL after this was never used, for example because its client gave
+/// up just as the pipeline was handed over.
+const PIPELINE_LIVE_DEADLINE: Duration = Duration::from_secs(30);
+
+/// Decides from its pipeline's state whether a frame pusher keeps going.
+struct PipelineWatch {
+    started: std::time::Instant,
+    was_live: bool,
+}
+
+impl PipelineWatch {
+    fn new(now: std::time::Instant) -> Self {
+        Self {
+            started: now,
+            was_live: false,
+        }
+    }
+
+    /// False once the pusher should stop: its pipeline was live and has gone
+    /// back to NULL, or it never went live within `PIPELINE_LIVE_DEADLINE`.
+    /// The pipeline is still NULL while gst-rtsp-server prepares it, so NULL
+    /// alone does not mean gone.
+    fn keep_going(&mut self, alive: bool, now: std::time::Instant) -> bool {
+        if alive {
+            self.was_live = true;
+            true
+        } else if self.was_live {
+            false
+        } else {
+            now.saturating_duration_since(self.started) < PIPELINE_LIVE_DEADLINE
+        }
+    }
+}
+
 /// True while an appsrc is still attached to a live pipeline.
 fn source_alive(src: &AppSrc) -> bool {
     let element: &Element = src.upcast_ref();
@@ -171,6 +219,27 @@ fn sources_alive(vid: &Option<AppSrc>, aud: &Option<AppSrc>) -> bool {
     vid.as_ref().is_some_and(source_alive) || aud.as_ref().is_some_and(source_alive)
 }
 
+/// Runs when a frame pusher exits, however it exits. Nothing will feed this
+/// media again, so end its streams and retire its cache key; otherwise the
+/// shared media stays cached and every later client joins a pipeline that
+/// never gets another frame. Retiring the key works on every GStreamer
+/// version, unlike `set_shared(false)`, which the factory only consults from
+/// 1.24 on.
+struct PusherExit {
+    vid_src: Option<AppSrc>,
+    aud_src: Option<AppSrc>,
+    key: MediaKey,
+}
+
+impl Drop for PusherExit {
+    fn drop(&mut self) {
+        for src in self.vid_src.iter().chain(self.aud_src.iter()) {
+            let _ = src.end_of_stream();
+        }
+        self.key.retire();
+    }
+}
+
 enum ClientMsg {
     NewClient {
         element: Element,
@@ -178,6 +247,7 @@ enum ClientMsg {
         /// waited on from the gst-rtsp-server client thread, which is not a
         /// tokio thread, and `recv_timeout` needs no runtime handle.
         reply: std::sync::mpsc::SyncSender<Element>,
+        key: MediaKey,
     },
 }
 
@@ -192,7 +262,11 @@ pub(super) async fn make_factory(
 
         while let Some(msg) = client_rx.recv().await {
             match msg {
-                ClientMsg::NewClient { element, reply } => {
+                ClientMsg::NewClient {
+                    element,
+                    reply,
+                    key,
+                } => {
                     log::debug!("New client for {name}::{stream}");
                     let camera = camera.clone();
                     let name = name.clone();
@@ -201,7 +275,6 @@ pub(super) async fn make_factory(
                         log::trace!("{name}::{stream}: Starting camera");
 
                         // Start the camera
-                        let config = camera.config().await?.borrow().clone();
                         let mut media_rx = camera.stream_while_live(stream).await?;
 
                         log::trace!("{name}::{stream}: Learning camera stream type");
@@ -255,8 +328,14 @@ pub(super) async fn make_factory(
                                 AnyResult::Ok(Some(src))
                             }
                             None => {
-                                build_unknown(&element, &config.splash_pattern.to_string())?;
-                                AnyResult::Ok(None)
+                                // A splash here would be cached as the shared
+                                // media and end after its test buffers, so
+                                // every later client would get a dead stream.
+                                // Refuse this client instead; it will retry.
+                                log::warn!(
+                                    "{name}::{stream}: No video while learning stream format; refusing client"
+                                );
+                                return AnyResult::Ok(());
                             }
                         }?;
 
@@ -308,8 +387,17 @@ pub(super) async fn make_factory(
                         // async context, so block_on is safe here.
                         let runtime = tokio::runtime::Handle::current();
                         std::thread::spawn(move || {
+                            let _exit = PusherExit {
+                                vid_src: vid_src.clone(),
+                                aud_src: aud_src.clone(),
+                                key,
+                            };
                             let mut clock = MediaClock::new(stream_config.fps);
                             let mut stats = TsStats::new(format!("{name}::{stream}"));
+                            // P-frames are dropped until a keyframe has been
+                            // pushed: at start, after any dropped frame and
+                            // after resubscribing to the camera.
+                            let mut need_keyframe = true;
 
                             log::trace!("{name}::{stream}: Sending buffered frames");
                             for buffered in buffer.drain(..) {
@@ -320,11 +408,14 @@ pub(super) async fn make_factory(
                                     &mut clock,
                                     &stream_config,
                                     &mut stats,
+                                    &mut need_keyframe,
                                 )?;
                             }
 
                             log::trace!("{name}::{stream}: Sending new frames");
-                            loop {
+                            let mut backoff = RESUBSCRIBE_BACKOFF_MIN;
+                            let mut watch = PipelineWatch::new(std::time::Instant::now());
+                            'frames: loop {
                                 // Bounded wait so that a client that has gone
                                 // away is noticed even if the camera has also
                                 // stopped sending. An unbounded blocking_recv
@@ -334,8 +425,51 @@ pub(super) async fn make_factory(
                                     tokio::time::timeout(IDLE_CHECK_INTERVAL, media_rx.recv()).await
                                 });
                                 let data = match next {
-                                    Ok(Some(data)) => data,
-                                    Ok(None) => break,
+                                    Ok(Some(data)) => {
+                                        backoff = RESUBSCRIBE_BACKOFF_MIN;
+                                        data
+                                    }
+                                    Ok(None) => {
+                                        // The camera side ended (relogin,
+                                        // dropped connection) but the client
+                                        // is still watching. Subscribe again
+                                        // rather than leave it on a media
+                                        // that will never get another frame.
+                                        loop {
+                                            std::thread::sleep(backoff);
+                                            backoff = (backoff * 2).min(RESUBSCRIBE_BACKOFF_MAX);
+                                            if !sources_alive(&vid_src, &aud_src) {
+                                                break 'frames;
+                                            }
+                                            // Bounded, so a client that leaves
+                                            // while the camera is offline is
+                                            // still noticed on the next pass.
+                                            match runtime.block_on(tokio::time::timeout(
+                                                RESUBSCRIBE_TIMEOUT,
+                                                camera.stream_while_live(stream),
+                                            )) {
+                                                Ok(Ok(new_rx)) => {
+                                                    log::debug!(
+                                                        "{name}::{stream}: Camera stream resubscribed"
+                                                    );
+                                                    media_rx = new_rx;
+                                                    need_keyframe = true;
+                                                    clock.camera_restarted();
+                                                    continue 'frames;
+                                                }
+                                                Ok(Err(e)) => {
+                                                    log::debug!(
+                                                        "{name}::{stream}: Camera stream resubscribe failed: {e:?}"
+                                                    );
+                                                }
+                                                Err(_) => {
+                                                    log::debug!(
+                                                        "{name}::{stream}: Camera stream resubscribe timed out"
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    }
                                     Err(_) => {
                                         if sources_alive(&vid_src, &aud_src) {
                                             continue;
@@ -346,6 +480,14 @@ pub(super) async fn make_factory(
                                         break;
                                     }
                                 };
+                                // Follow a frame rate change reported
+                                // mid-stream.
+                                if let BcMedia::InfoV1(BcMediaInfoV1 { fps, .. })
+                                | BcMedia::InfoV2(BcMediaInfoV2 { fps, .. }) = &data
+                                {
+                                    stream_config.update_fps(*fps as u32);
+                                    clock.set_fps(stream_config.fps);
+                                }
                                 let r = send_to_sources(
                                     data,
                                     &vid_src,
@@ -353,6 +495,7 @@ pub(super) async fn make_factory(
                                     &mut clock,
                                     &stream_config,
                                     &mut stats,
+                                    &mut need_keyframe,
                                 );
                                 if let Err(r) = &r {
                                     // Normal at teardown: the media was
@@ -361,6 +504,21 @@ pub(super) async fn make_factory(
                                     log::debug!("Failed to send to source: {r:?}");
                                 }
                                 r?;
+                                // An unprepared media leaves this bin in a
+                                // NULL pipeline where pushes still succeed
+                                // (as Flushing), so check after every frame
+                                // rather than only when the camera goes idle.
+                                // Otherwise this thread keeps the camera
+                                // stream open for a pipeline nobody plays.
+                                if !watch.keep_going(
+                                    sources_alive(&vid_src, &aud_src),
+                                    std::time::Instant::now(),
+                                ) {
+                                    log::debug!(
+                                        "{name}::{stream}: Pipeline gone or never went live; stopping"
+                                    );
+                                    break;
+                                }
                             }
                             log::trace!("All media recieved");
                             AnyResult::Ok(())
@@ -374,16 +532,23 @@ pub(super) async fn make_factory(
     });
 
     // Now setup the factory
-    let factory = NeoMediaFactory::new_with_callback(move |element| {
+    let factory = NeoMediaFactory::new_with_callback(move |element, key| {
         let (reply, new_element) = std::sync::mpsc::sync_channel::<Element>(1);
         // try_send, not blocking_send: if the builder task is wedged we must
         // fail this client rather than block the shared client thread.
         client_tx
-            .try_send(ClientMsg::NewClient { element, reply })
+            .try_send(ClientMsg::NewClient {
+                element,
+                reply,
+                key,
+            })
             .map_err(|e| anyhow!("Pipeline builder is not accepting clients: {e}"))?;
 
         match new_element.recv_timeout(CLIENT_BUILD_TIMEOUT) {
             Ok(element) => Ok(Some(element)),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                Err(anyhow!("Pipeline builder gave up without a pipeline"))
+            }
             Err(e) => Err(anyhow!(
                 "Timed out after {}s waiting for the pipeline: {e}",
                 CLIENT_BUILD_TIMEOUT.as_secs()
@@ -409,6 +574,11 @@ struct MediaClock {
     started: std::time::Instant,
     vid_pts_us: u64,
     vid_step_us: u64,
+    /// PTS of the last video frame handed out. `vid_pts_us` is already the
+    /// next frame's PTS, one step later. None until the first video frame.
+    last_vid_pts_us: Option<u64>,
+    /// Camera timestamp of the last video frame, for frame spacing.
+    last_cam_us: Option<u32>,
     aud_pts_us: u64,
     aud_started: bool,
     /// Extra lead applied to audio, in microseconds. Positive moves audio
@@ -420,17 +590,21 @@ struct MediaClock {
 }
 
 impl MediaClock {
-    /// Beyond this video jumps instead of slewing.
+    /// Video further behind the wall clock than this jumps forward instead
+    /// of slewing.
     const VID_SNAP_US: i64 = 1_000_000;
-    /// How far audio may sit off the video timeline before it is realigned
-    /// rather than slewed. Below the ~100ms where desync becomes audible.
-    const AUD_RESYNC_US: i64 = 80_000;
+    /// Audio further behind the video timeline than this jumps forward
+    /// instead of slewing. Wider than two 64ms AAC frames, so audio that
+    /// arrives a few frames at a time does not trip it.
+    const AUD_RESYNC_US: i64 = 150_000;
 
     fn new(fps: u32) -> Self {
         Self {
             started: std::time::Instant::now(),
             vid_pts_us: 0,
             vid_step_us: 1_000_000 / (fps.max(1) as u64),
+            last_vid_pts_us: None,
+            last_cam_us: None,
             aud_pts_us: 0,
             aud_started: false,
             aud_lead_us: std::env::var("NEOLINK_AUDIO_LEAD_MS")
@@ -447,28 +621,62 @@ impl MediaClock {
         self.started.elapsed().as_micros() as i64
     }
 
-    /// PTS for the next video frame, in microseconds.
-    fn next_video(&mut self, name: &str) -> u64 {
-        let pts = self.vid_pts_us;
-        let err = pts as i64 - self.wall_us();
+    /// A new camera stream may restart its frame timestamps, so the next
+    /// frame is spaced by the nominal step rather than by a bogus delta.
+    fn camera_restarted(&mut self) {
+        self.last_cam_us = None;
+    }
 
-        if err.abs() > Self::VID_SNAP_US {
-            // Too far out to slew: the stream stalled, the camera slept, or
-            // we are at startup. Jump rather than compressing real elapsed
+    /// Nominal frame rate, used where the camera gives no frame spacing.
+    fn set_fps(&mut self, fps: u32) {
+        self.vid_step_us = 1_000_000 / (fps.max(1) as u64);
+    }
+
+    /// PTS for the next video frame, in microseconds. `cam_us` is the
+    /// camera's timestamp for this frame.
+    fn next_video(&mut self, cam_us: u32, name: &str) -> u64 {
+        let wall_us = self.wall_us();
+        self.next_video_at(wall_us, cam_us, name)
+    }
+
+    /// `next_video` with the wall clock passed in, so tests can drive it.
+    ///
+    /// PTS only ever moves forward. A backward step makes downstream
+    /// elements and players drop or reorder frames.
+    fn next_video_at(&mut self, wall_us: i64, cam_us: u32, name: &str) -> u64 {
+        let pts = self.vid_pts_us;
+        let err = pts as i64 - wall_us;
+
+        // Space frames by the camera's own timestamps, so PTS follows the
+        // rate the camera actually delivers rather than the configured one.
+        // A camera set to 15 fps that sends 12 would otherwise fall behind
+        // the wall clock faster than the slew can follow, and snap every
+        // few seconds. Clamped so one bad timestamp cannot run away.
+        let nominal = self.vid_step_us as i64;
+        let step = match self.last_cam_us.replace(cam_us) {
+            Some(last) => (cam_us.wrapping_sub(last) as i64).clamp(nominal / 4, nominal * 4),
+            None => nominal,
+        };
+
+        if err < -Self::VID_SNAP_US {
+            // Too far behind to slew: the stream stalled, the camera slept,
+            // or we are at startup. Jump rather than compressing real elapsed
             // time into a slow correction.
             self.vid_snaps += 1;
             log::debug!("{name}: video clock snap, was {}ms out", err / 1000);
-            let wall = self.wall_us().max(0) as u64;
-            self.vid_pts_us = wall.saturating_add(self.vid_step_us);
+            let wall = wall_us.max(0) as u64;
+            self.vid_pts_us = wall.saturating_add(step as u64);
+            self.last_vid_pts_us = Some(wall);
             return wall;
         }
 
-        // Capped at 1% of a frame interval so frame spacing stays even.
-        let max_corr = (self.vid_step_us / 100).max(1) as i64;
-        let corr = (-err / 64).clamp(-max_corr, max_corr);
-        self.vid_pts_us = self
-            .vid_pts_us
-            .saturating_add((self.vid_step_us as i64 + corr).max(1) as u64);
+        // Behind: capped at 1% of a frame interval so frame spacing stays
+        // even. Ahead, typically after the burst that follows a stall: up to
+        // half an interval, so the lead drains in seconds while every PTS
+        // still lands after the one before it.
+        let corr = (-err / 64).clamp(-(step / 2), (step / 100).max(1));
+        self.vid_pts_us = self.vid_pts_us.saturating_add((step + corr).max(1) as u64);
+        self.last_vid_pts_us = Some(pts);
         pts
     }
 
@@ -481,11 +689,15 @@ impl MediaClock {
     /// the video timeline is the anchor, NOT the wall clock. Anchoring to
     /// arrival time instead puts audio permanently one frame duration late
     /// and turns every lost packet into accumulated error.
-    fn next_audio(&mut self, duration_us: u64, name: &str) -> u64 {
+    ///
+    /// Returns None until the first video frame, since there is nothing to
+    /// anchor to yet. Like video, audio PTS only ever moves forward.
+    fn next_audio(&mut self, duration_us: u64, name: &str) -> Option<u64> {
+        let last_vid_pts_us = self.last_vid_pts_us?;
         // The frame that has just arrived covers roughly
         // [anchor - duration, anchor] on the video timeline, because the
         // encoder could not emit it until the last of its samples existed.
-        let anchor = (self.vid_pts_us as i64)
+        let anchor = (last_vid_pts_us as i64)
             .saturating_sub(duration_us as i64)
             .saturating_sub(self.aud_lead_us)
             .max(0);
@@ -497,7 +709,7 @@ impl MediaClock {
 
         let err = self.aud_pts_us as i64 - anchor;
 
-        if err.abs() > Self::AUD_RESYNC_US {
+        if err < -Self::AUD_RESYNC_US {
             // Audio frames went missing, so there is a real gap here. Jumping
             // to the anchor renders it as the short silence it actually is.
             // Slewing instead would compress the surviving audio and hold the
@@ -510,19 +722,20 @@ impl MediaClock {
             self.aud_pts_us = anchor as u64;
             let pts = self.aud_pts_us;
             self.aud_pts_us = self.aud_pts_us.saturating_add(duration_us);
-            return pts;
+            return Some(pts);
         }
 
-        // Small residual drift between the accumulated audio duration and the
-        // video timeline gets slewed out, capped at 0.1% of frame duration so
-        // frame spacing stays even and resyncs stay rare.
-        let max_corr = (duration_us / 1000).max(1) as i64;
+        // Otherwise stay contiguous and slew out the residual. Audio ahead of
+        // the anchor is normal when frames arrive a few at a time, so it is
+        // never jumped back. The cap of 1/8 of a frame keeps every PTS after
+        // the one before it.
+        let max_corr = (duration_us / 8).max(1) as i64;
         let corr = (-err / 64).clamp(-max_corr, max_corr);
         let pts = self.aud_pts_us;
         self.aud_pts_us = self
             .aud_pts_us
             .saturating_add((duration_us as i64 + corr).max(1) as u64);
-        pts
+        Some(pts)
     }
 }
 
@@ -624,28 +837,32 @@ fn send_to_sources(
     clock: &mut MediaClock,
     stream_config: &StreamConfig,
     stats: &mut TsStats,
+    need_keyframe: &mut bool,
 ) -> AnyResult<()> {
+    let keyframe = matches!(data, BcMedia::Iframe(_));
     // Update TS
     match data {
         BcMedia::Aac(aac) => {
             let duration = aac.duration().expect("Could not calculate AAC duration");
-            let pts = clock.next_audio(duration as u64, &stats.name);
-            if let Some(aud_src) = aud_src.as_ref() {
-                log::debug!("Sending AAC: {:?}", Duration::from_micros(pts));
-                send_to_appsrc(aud_src, aac.data, Duration::from_micros(pts))?;
+            if let Some(pts) = clock.next_audio(duration as u64, &stats.name) {
+                if let Some(aud_src) = aud_src.as_ref() {
+                    log::debug!("Sending AAC: {:?}", Duration::from_micros(pts));
+                    send_to_appsrc(aud_src, aac.data, Duration::from_micros(pts))?;
+                }
+                stats.note_audio(pts, duration as u64);
             }
-            stats.note_audio(pts, duration as u64);
         }
         BcMedia::Adpcm(adpcm) => {
             let duration = adpcm
                 .duration()
                 .expect("Could not calculate ADPCM duration");
-            let pts = clock.next_audio(duration as u64, &stats.name);
-            if let Some(aud_src) = aud_src.as_ref() {
-                log::trace!("Sending ADPCM: {:?}", Duration::from_micros(pts));
-                send_to_appsrc(aud_src, adpcm.data, Duration::from_micros(pts))?;
+            if let Some(pts) = clock.next_audio(duration as u64, &stats.name) {
+                if let Some(aud_src) = aud_src.as_ref() {
+                    log::trace!("Sending ADPCM: {:?}", Duration::from_micros(pts));
+                    send_to_appsrc(aud_src, adpcm.data, Duration::from_micros(pts))?;
+                }
+                stats.note_audio(pts, duration as u64);
             }
-            stats.note_audio(pts, duration as u64);
         }
         BcMedia::Iframe(BcMediaIframe {
             data, microseconds, ..
@@ -653,10 +870,15 @@ fn send_to_sources(
         | BcMedia::Pframe(BcMediaPframe {
             data, microseconds, ..
         }) => {
-            let pts = clock.next_video(&stats.name);
+            let pts = clock.next_video(microseconds, &stats.name);
             if let Some(vid_src) = vid_src.as_ref() {
-                log::trace!("Sending VID: {:?}", Duration::from_micros(pts));
-                send_to_appsrc(vid_src, data, Duration::from_micros(pts))?;
+                // A P-frame after a missing frame decodes against the wrong
+                // reference and smears until the next keyframe, so wait for
+                // that keyframe instead.
+                if keyframe || !*need_keyframe {
+                    log::trace!("Sending VID: {:?}", Duration::from_micros(pts));
+                    *need_keyframe = !send_to_appsrc(vid_src, data, Duration::from_micros(pts))?;
+                }
             }
             stats.note_video(microseconds, pts, stream_config.fps, clock);
         }
@@ -675,7 +897,8 @@ fn send_to_sources(
 /// grow without limit.
 const APPSRC_QUEUE_SLACK: u64 = 4;
 
-fn send_to_appsrc(appsrc: &AppSrc, data: Vec<u8>, mut ts: Duration) -> AnyResult<()> {
+/// Returns whether the frame was pushed; false when it was dropped.
+fn send_to_appsrc(appsrc: &AppSrc, data: Vec<u8>, mut ts: Duration) -> AnyResult<bool> {
     check_live(appsrc)?; // Stop if appsrc is dropped
 
     // In live mode we follow the advice in
@@ -691,11 +914,11 @@ fn send_to_appsrc(appsrc: &AppSrc, data: Vec<u8>, mut ts: Duration) -> AnyResult
                 ts = Duration::from_micros(time.useconds());
             } else {
                 // Not playing
-                return Ok(());
+                return Ok(false);
             }
         } else {
             // Clock not up yet
-            return Ok(());
+            return Ok(false);
         }
     }
     // Don't let the appsrc queue grow without bound if the client stalls.
@@ -710,7 +933,7 @@ fn send_to_appsrc(appsrc: &AppSrc, data: Vec<u8>, mut ts: Duration) -> AnyResult
             appsrc.current_level_bytes(),
             max_bytes,
         );
-        return Ok(());
+        return Ok(false);
     }
 
     // Hand the frame we already own straight to gstreamer.
@@ -736,7 +959,7 @@ fn send_to_appsrc(appsrc: &AppSrc, data: Vec<u8>, mut ts: Duration) -> AnyResult
     };
 
     // Push buffer into the appsrc
-    match appsrc.push_buffer(buf) {
+    let pushed = match appsrc.push_buffer(buf) {
         Ok(_) => {
             // log::info!(
             //     "Send {}{} on {}",
@@ -744,7 +967,7 @@ fn send_to_appsrc(appsrc: &AppSrc, data: Vec<u8>, mut ts: Duration) -> AnyResult
             //     if data.keyframe { " (keyframe)" } else { "" },
             //     appsrc.name()
             // );
-            Ok(())
+            Ok(true)
         }
         Err(FlowError::Flushing) => {
             // NOT "buffer full" - appsrc returns Flushing when the element is
@@ -759,7 +982,7 @@ fn send_to_appsrc(appsrc: &AppSrc, data: Vec<u8>, mut ts: Duration) -> AnyResult
                     .and_then(|p| p.downcast::<Element>().ok())
                     .map(|p| p.current_state()),
             );
-            Ok(())
+            Ok(false)
         }
         Err(e) => Err(anyhow!("Error in streaming: {e:?}")),
     }?;
@@ -769,7 +992,7 @@ fn send_to_appsrc(appsrc: &AppSrc, data: Vec<u8>, mut ts: Duration) -> AnyResult
     // PAUSED and released frames in bursts, which shows up as stutter-then-
     // catch-up in viewers. Smoothing is the downstream `queue` element's job;
     // it is bounded, so it cannot grow without limit the way this appsrc can.
-    Ok(())
+    Ok(pushed)
 }
 fn check_live(app: &AppSrc) -> Result<()> {
     app.bus().ok_or(anyhow!("App source is closed"))?;
@@ -883,6 +1106,9 @@ fn build_h264(bin: &Element, stream_config: &StreamConfig) -> Result<AppSrc> {
         .map_err(|_| anyhow!("Media source's element should be a bin"))?;
 
     let payload = make_element("rtph264pay", "pay0")?;
+    // Repeat SPS and PPS with every IDR frame, so a client that joins or
+    // loses packets mid-stream can start decoding at the next keyframe.
+    payload.set_property("config-interval", -1i32);
     bin.add_many([&payload])?;
     Element::link_many([&linked.output, &payload])?;
     Ok(linked.appsrc)
@@ -934,6 +1160,8 @@ fn build_h265(bin: &Element, stream_config: &StreamConfig) -> Result<AppSrc> {
         .map_err(|_| anyhow!("Media source's element should be a bin"))?;
 
     let payload = make_element("rtph265pay", "pay0")?;
+    // Repeat VPS, SPS and PPS with every IDR frame, as for H264.
+    payload.set_property("config-interval", -1i32);
     bin.add_many([&payload])?;
     Element::link_many([&linked.output, &payload])?;
     Ok(linked.appsrc)
@@ -1287,4 +1515,368 @@ fn make_queue(name: &str, buffer_size: u32) -> AnyResult<Element> {
 fn buffer_size(bitrate: u32) -> u32 {
     // 0.1 seconds (according to bitrate) or 4kb what ever is larger
     std::cmp::max(bitrate * 2 / 8u32, 4u32 * 1024u32)
+}
+
+#[cfg(test)]
+mod watch_tests {
+    use super::{PipelineWatch, PIPELINE_LIVE_DEADLINE};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn waits_for_the_pipeline_to_go_live() {
+        let t0 = Instant::now();
+        let mut watch = PipelineWatch::new(t0);
+        assert!(watch.keep_going(false, t0 + Duration::from_secs(1)));
+        assert!(watch.keep_going(true, t0 + Duration::from_secs(2)));
+        // Once live, the deadline no longer applies.
+        assert!(watch.keep_going(true, t0 + PIPELINE_LIVE_DEADLINE * 10));
+    }
+
+    #[test]
+    fn stops_when_a_live_pipeline_goes() {
+        let t0 = Instant::now();
+        let mut watch = PipelineWatch::new(t0);
+        assert!(watch.keep_going(true, t0));
+        assert!(!watch.keep_going(false, t0 + Duration::from_millis(100)));
+    }
+
+    #[test]
+    fn stops_when_the_pipeline_never_goes_live() {
+        let t0 = Instant::now();
+        let mut watch = PipelineWatch::new(t0);
+        let just_before = t0 + PIPELINE_LIVE_DEADLINE - Duration::from_millis(1);
+        assert!(watch.keep_going(false, just_before));
+        assert!(!watch.keep_going(false, t0 + PIPELINE_LIVE_DEADLINE));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MediaClock;
+
+    const AAC_US: u64 = 64_000;
+
+    enum Ev {
+        /// A video frame with its camera timestamp.
+        Video(u32),
+        Audio,
+    }
+
+    #[derive(Default)]
+    struct Run {
+        vid_back: u32,
+        aud_back: u32,
+        vid_snaps: u64,
+        aud_snaps: u64,
+    }
+
+    /// Feeds `(wall_us, event)` pairs, in arrival order, through a clock
+    /// that nominally runs at 15 fps and counts PTS that fail to increase.
+    fn run(mut events: Vec<(i64, Ev)>) -> Run {
+        events.sort_by_key(|(wall, _)| *wall);
+        let mut clock = MediaClock::new(15);
+        clock.aud_lead_us = 0;
+        let mut out = Run::default();
+        let (mut last_vid, mut last_aud) = (None, None);
+        for (wall, ev) in events {
+            match ev {
+                Ev::Video(cam_us) => {
+                    let pts = clock.next_video_at(wall, cam_us, "test");
+                    if last_vid.is_some_and(|last| pts <= last) {
+                        out.vid_back += 1;
+                    }
+                    last_vid = Some(pts);
+                }
+                Ev::Audio => {
+                    if let Some(pts) = clock.next_audio(AAC_US, "test") {
+                        if last_aud.is_some_and(|last| pts <= last) {
+                            out.aud_back += 1;
+                        }
+                        last_aud = Some(pts);
+                    }
+                }
+            }
+        }
+        out.vid_snaps = clock.vid_snaps;
+        out.aud_snaps = clock.aud_snaps;
+        out
+    }
+
+    /// Video frames every `interval_us` over `[from_us, to_us)`, each
+    /// arriving as soon as the camera stamps it.
+    fn video(from_us: i64, to_us: i64, interval_us: i64) -> Vec<(i64, Ev)> {
+        (0..)
+            .map(|i| from_us + i * interval_us)
+            .take_while(|t| *t < to_us)
+            .map(|t| (t, Ev::Video(t as u32)))
+            .collect()
+    }
+
+    /// Audio frames back to back over `(0, to_us)`, each arriving as its
+    /// last sample is captured.
+    fn audio(to_us: i64) -> Vec<(i64, Ev)> {
+        (1..to_us / AAC_US as i64)
+            .map(|i| (i * AAC_US as i64, Ev::Audio))
+            .collect()
+    }
+
+    #[test]
+    fn stall_then_burst_never_steps_back() {
+        let step = 1_000_000 / 15;
+        // 10 s steady, a 2 s stall, the 30 held frames in 100 ms, then 60 s
+        // steady. Audio stalls with video and arrives in the same burst.
+        let mut events = video(0, 10_000_000, step);
+        // The camera kept stamping frames through the stall.
+        events.extend((0..30).map(|i| {
+            let cam_us = 10_000_000 + i * step;
+            (12_000_000 + i * 100_000 / 30, Ev::Video(cam_us as u32))
+        }));
+        events.extend(video(12_100_000, 72_100_000, step));
+        for i in 0..(72_000_000 / AAC_US as i64) {
+            let t = (i + 1) * AAC_US as i64;
+            let t = if (10_000_000..12_000_000).contains(&t) {
+                12_000_000 + (t - 10_000_000) / 20
+            } else {
+                t
+            };
+            events.push((t, Ev::Audio));
+        }
+        let r = run(events);
+        assert_eq!(r.vid_back, 0);
+        assert_eq!(r.aud_back, 0);
+        assert!(r.vid_snaps <= 2, "{} video snaps", r.vid_snaps);
+    }
+
+    #[test]
+    fn bursty_audio_stays_locked() {
+        // Audio arrives three 64 ms frames at a time every 192 ms.
+        let mut events = video(0, 60_000_000, 1_000_000 / 15);
+        for burst in 1..(60_000_000 / 192_000) {
+            events.extend((0..3).map(|_| (burst * 192_000, Ev::Audio)));
+        }
+        let r = run(events);
+        assert_eq!(r.vid_back, 0);
+        assert_eq!(r.aud_back, 0);
+        assert!(r.aud_snaps <= 5, "{} audio resyncs in 60 s", r.aud_snaps);
+    }
+
+    #[test]
+    fn jittery_audio_stays_locked() {
+        // Audio arrival jitters by up to +/-30 ms around its nominal time.
+        let mut events = video(0, 60_000_000, 1_000_000 / 15);
+        let mut seed: u64 = 0x2545_f491_4f6c_dd1d;
+        for i in 1..(60_000_000 / AAC_US as i64) {
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let jitter = ((seed >> 33) % 60_001) as i64 - 30_000;
+            events.push((i * AAC_US as i64 + jitter, Ev::Audio));
+        }
+        let r = run(events);
+        assert_eq!(r.vid_back, 0);
+        assert_eq!(r.aud_back, 0);
+        assert!(r.aud_snaps <= 5, "{} audio resyncs in 60 s", r.aud_snaps);
+    }
+
+    #[test]
+    fn slow_camera_follows_its_own_timestamps() {
+        // The camera is configured for 15 fps but delivers fewer.
+        for real_fps in [8, 10, 12, 14] {
+            let mut events = video(0, 60_000_000, 1_000_000 / real_fps);
+            events.extend(audio(60_000_000));
+            let r = run(events);
+            assert_eq!(r.vid_back, 0, "{real_fps} fps");
+            assert_eq!(r.aud_back, 0, "{real_fps} fps");
+            assert_eq!(r.vid_snaps, 0, "{real_fps} fps");
+            assert!(r.aud_snaps <= 2, "{real_fps} fps: {} resyncs", r.aud_snaps);
+        }
+    }
+
+    const STEP_US: i64 = 1_000_000 / 15;
+
+    /// Feeds video frames, as `(wall_us, cam_us)` in arrival order, through
+    /// `clock` and returns each PTS with its wall time.
+    fn video_pts(clock: &mut MediaClock, frames: &[(i64, u32)]) -> Vec<(i64, u64)> {
+        frames
+            .iter()
+            .map(|&(wall, cam_us)| (wall, clock.next_video_at(wall, cam_us, "test")))
+            .collect()
+    }
+
+    fn assert_increasing(pts: &[(i64, u64)]) {
+        for pair in pts.windows(2) {
+            assert!(pair[1].1 > pair[0].1, "PTS stepped back: {:?}", pair);
+        }
+    }
+
+    /// Largest lead of PTS over wall time, in microseconds.
+    fn max_lead_us(pts: &[(i64, u64)]) -> i64 {
+        pts.iter()
+            .map(|&(wall, pts)| pts as i64 - wall)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// 15 fps frames `i` in `range`, arriving on time, stamped by `cam`.
+    fn steady(range: std::ops::Range<i64>, cam: impl Fn(i64) -> u32) -> Vec<(i64, u32)> {
+        range.map(|i| (i * STEP_US, cam(i))).collect()
+    }
+
+    #[test]
+    fn camera_timestamp_wrap_keeps_spacing() {
+        // The camera's u32 microsecond clock wraps every 71.6 minutes. Start
+        // 2 s before the wrap and run 60 s across it.
+        let start = u32::MAX - 2_000_000;
+        let frames = steady(0..900, |i| start.wrapping_add((i * STEP_US) as u32));
+        let mut clock = MediaClock::new(15);
+        let pts = video_pts(&mut clock, &frames);
+        assert_increasing(&pts);
+        assert_eq!(clock.vid_snaps, 0);
+        for pair in pts.windows(2) {
+            let delta = (pair[1].1 - pair[0].1) as i64;
+            assert!(
+                (delta - STEP_US).abs() <= STEP_US / 50,
+                "spacing {} us around {:?}",
+                delta,
+                pair
+            );
+        }
+    }
+
+    #[test]
+    fn camera_timestamp_reset_without_notice_is_bounded() {
+        // 30 s stamped from 50 s, then the camera restarts its clock at 0 on
+        // the same stream. The backward jump reads as a huge forward step,
+        // which the clamp limits to four frame intervals.
+        let frames = steady(0..1800, |i| {
+            if i < 900 {
+                (50_000_000 + i * STEP_US) as u32
+            } else {
+                ((i - 900) * STEP_US) as u32
+            }
+        });
+        let mut clock = MediaClock::new(15);
+        let pts = video_pts(&mut clock, &frames);
+        assert_increasing(&pts);
+        assert_eq!(clock.vid_snaps, 0);
+        assert!(
+            max_lead_us(&pts) <= 4 * STEP_US,
+            "lead {} us",
+            max_lead_us(&pts)
+        );
+        // The lead drains: 10 s later PTS is back within a frame of wall time.
+        let (wall, last) = *pts.last().unwrap();
+        assert!((last as i64 - wall).abs() < STEP_US);
+    }
+
+    #[test]
+    fn camera_restarted_spaces_the_next_frame_nominally() {
+        let mut clock = MediaClock::new(15);
+        let before = video_pts(
+            &mut clock,
+            &steady(0..150, |i| (80_000_000 + i * STEP_US) as u32),
+        );
+        clock.camera_restarted();
+        let after = video_pts(
+            &mut clock,
+            &steady(150..300, |i| ((i - 150) * STEP_US) as u32),
+        );
+        let joined: Vec<_> = before.iter().chain(after.iter()).copied().collect();
+        assert_increasing(&joined);
+        let first_gap = (after[0].1 - before.last().unwrap().1) as i64;
+        assert!(
+            (first_gap - STEP_US).abs() <= STEP_US / 50,
+            "gap {} us",
+            first_gap
+        );
+        assert!(max_lead_us(&joined) < STEP_US / 2);
+        assert_eq!(clock.vid_snaps, 0);
+    }
+
+    #[test]
+    fn fps_change_follows_the_new_rate() {
+        // 30 s at 15 fps, then the camera reports and delivers 25 fps.
+        let step25 = 1_000_000 / 25;
+        let mut clock = MediaClock::new(15);
+        let mut pts = video_pts(&mut clock, &steady(0..450, |i| (i * STEP_US) as u32));
+        clock.set_fps(25);
+        let switch = 450 * STEP_US;
+        let later: Vec<(i64, u32)> = (0..750)
+            .map(|i| (switch + i * step25, (switch + i * step25) as u32))
+            .collect();
+        pts.extend(video_pts(&mut clock, &later));
+        assert_increasing(&pts);
+        assert_eq!(clock.vid_snaps, 0);
+        let tail = &pts[pts.len() - 100..];
+        for pair in tail.windows(2) {
+            let delta = (pair[1].1 - pair[0].1) as i64;
+            assert!(
+                (delta - step25).abs() <= step25 / 50,
+                "spacing {} us",
+                delta
+            );
+        }
+        assert!(max_lead_us(&pts) < step25);
+    }
+
+    #[test]
+    fn zero_fps_does_not_divide_by_zero() {
+        let mut clock = MediaClock::new(0);
+        clock.set_fps(0);
+        let pts = video_pts(&mut clock, &[(0, 0), (1_000_000, 1_000_000)]);
+        assert_increasing(&pts);
+    }
+
+    #[test]
+    fn pts_lead_over_wall_is_bounded() {
+        // Steady camera timestamps, arrival jittered by up to +/-30 ms: PTS
+        // never leads the wall clock by more than the jitter plus a frame.
+        let mut seed: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut frames: Vec<(i64, u32)> = (0..900)
+            .map(|i| {
+                seed = seed
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                let jitter = ((seed >> 33) % 60_001) as i64 - 30_000;
+                ((i * STEP_US + jitter).max(0), (i * STEP_US) as u32)
+            })
+            .collect();
+        frames.sort_by_key(|f| f.0);
+        let mut clock = MediaClock::new(15);
+        let pts = video_pts(&mut clock, &frames);
+        assert_increasing(&pts);
+        assert!(
+            max_lead_us(&pts) <= 30_000 + STEP_US,
+            "lead {} us",
+            max_lead_us(&pts)
+        );
+
+        // After a 2 s stall the held frames arrive in a 100 ms burst. The
+        // lead is bounded by the camera time the burst covers, and drains.
+        let mut clock = MediaClock::new(15);
+        let mut frames = steady(0..150, |i| (i * STEP_US) as u32);
+        frames.extend((0..30).map(|i| {
+            (
+                12_000_000 + i * 100_000 / 30,
+                (10_000_000 + i * STEP_US) as u32,
+            )
+        }));
+        frames.extend((0..450).map(|i| {
+            let t = 12_100_000 + i * STEP_US;
+            (t, (12_000_000 + i * STEP_US) as u32)
+        }));
+        let pts = video_pts(&mut clock, &frames);
+        assert_increasing(&pts);
+        assert!(
+            max_lead_us(&pts) <= 30 * STEP_US,
+            "lead {} us",
+            max_lead_us(&pts)
+        );
+        let (wall, last) = *pts.last().unwrap();
+        assert!(
+            (last as i64 - wall).abs() < STEP_US,
+            "lead {} us after 30 s",
+            last as i64 - wall
+        );
+    }
 }

@@ -3,7 +3,38 @@ use super::*;
 use crate::common::UseCounter;
 use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
 use neolink_core::{bc_protocol::StreamKind, bcmedia::model::BcMedia};
-use tokio::sync::mpsc::Receiver as MpscReceiver;
+use std::{
+    future::Future,
+    pin::Pin,
+    task::{Context, Poll},
+};
+use tokio::{
+    sync::mpsc::Receiver as MpscReceiver,
+    task::{JoinError, JoinHandle},
+};
+
+/// A task handle that aborts its task when dropped.
+///
+/// Dropping a plain `JoinHandle` detaches the task. The motion and push
+/// notification watchers loop until their channel closes, so a detached
+/// watcher keeps running, and keeps its permit, after the future that
+/// spawned it was dropped, for example by a caller's timeout before the
+/// camera task took ownership of it, or after the camera task ended.
+struct AbortOnDrop<T>(JoinHandle<T>);
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+impl<T> Future for AbortOnDrop<T> {
+    type Output = Result<T, JoinError>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        Pin::new(&mut self.get_mut().0).poll(cx)
+    }
+}
 
 #[cfg(feature = "pushnoti")]
 use crate::common::PushNoti;
@@ -53,7 +84,7 @@ impl NeoInstance {
             };
             // Now listen to the motion
             let thread_name = name.clone();
-            tasks.push(tokio::spawn(
+            tasks.push(AbortOnDrop(tokio::spawn(
                 async move {
                     loop {
                         match md.changed().await {
@@ -83,7 +114,7 @@ impl NeoInstance {
                     log::debug!("Motion thread stopped {e:?}");
                     e
                 }),
-            ));
+            )));
 
             #[cfg(feature = "pushnoti")]
             {
@@ -92,7 +123,7 @@ impl NeoInstance {
                 let mut pn = self.push_notifications().await?;
                 pn.borrow_and_update(); // Ignore any PNs that have already been sent before this
                 let thread_name = name.clone();
-                tasks.push(tokio::spawn(
+                tasks.push(AbortOnDrop(tokio::spawn(
                     async move {
                         loop {
                             let noti: Option<PushNoti> = pn.borrow_and_update().clone();
@@ -120,7 +151,7 @@ impl NeoInstance {
                         log::debug!("PN thread stopped {e:?}");
                         e
                     }),
-                ));
+                )));
             }
 
             // Send the camera when the pemit is active
@@ -203,5 +234,45 @@ impl NeoInstance {
         );
 
         Ok(media_rx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AbortOnDrop;
+    use futures::stream::FuturesUnordered;
+    use tokio::sync::oneshot;
+
+    /// A task that never ends on its own, like a watcher whose channel stays
+    /// open. Its sender is dropped only when the task is dropped.
+    fn watcher() -> (AbortOnDrop<()>, oneshot::Receiver<()>) {
+        let (alive, gone) = oneshot::channel::<()>();
+        let task = tokio::spawn(async move {
+            let _alive = alive;
+            std::future::pending::<()>().await
+        });
+        (AbortOnDrop(task), gone)
+    }
+
+    #[tokio::test]
+    async fn dropping_the_handle_ends_the_task() {
+        let (task, gone) = watcher();
+        drop(task);
+        assert!(gone.await.is_err(), "the task ended and dropped its sender");
+    }
+
+    #[tokio::test]
+    async fn dropping_the_task_set_ends_every_task() {
+        let tasks = FuturesUnordered::new();
+        let mut gone = vec![];
+        for _ in 0..2 {
+            let (task, rx) = watcher();
+            tasks.push(task);
+            gone.push(rx);
+        }
+        drop(tasks);
+        for rx in gone {
+            assert!(rx.await.is_err());
+        }
     }
 }
