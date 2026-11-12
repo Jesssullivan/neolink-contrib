@@ -1409,18 +1409,12 @@ fn audio_tail(
             vec![resample, mono, encoder, parser, payload]
         }
         AudioCodec::Pcmu => {
+            // rtppcmupay accepts only 8000 Hz mono, so caps negotiation makes
+            // audioresample and the audioconvert before it produce that.
             let resample = make_element("audioresample", "audresample")?;
-            let narrow = make_element("capsfilter", "audcaps")?;
-            narrow.set_property(
-                "caps",
-                Caps::builder("audio/x-raw")
-                    .field("rate", 8000i32)
-                    .field("channels", 1i32)
-                    .build(),
-            );
             let encoder = make_element("mulawenc", "audmulawenc")?;
             let payload = make_element("rtppcmupay", "pay1")?;
-            vec![resample, narrow, encoder, payload]
+            vec![resample, encoder, payload]
         }
         AudioCodec::L16 => vec![make_element("rtpL16pay", "pay1")?],
         AudioCodec::None => return Ok(()),

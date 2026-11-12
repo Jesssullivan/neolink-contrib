@@ -53,9 +53,14 @@ fn generate(launch: &str) -> Vec<Buffer> {
 
 /// ADTS AAC frames, mono at `AAC_RATE`, as a Reolink camera sends them.
 fn camera_aac(frames: u32) -> Vec<Buffer> {
+    camera_aac_channels(frames, 1)
+}
+
+/// ADTS AAC frames at `AAC_RATE` with `channels` channels.
+fn camera_aac_channels(frames: u32, channels: u32) -> Vec<Buffer> {
     generate(&format!(
         "audiotestsrc wave=sine num-buffers={frames} samplesperbuffer={AAC_SAMPLES} \
-         ! audio/x-raw,format=S16LE,rate={AAC_RATE},channels=1 \
+         ! audio/x-raw,format=S16LE,rate={AAC_RATE},channels={channels} \
          ! voaacenc ! aacparse ! audio/mpeg,mpegversion=4,stream-format=adts \
          ! appsink name=out sync=false"
     ))
@@ -220,6 +225,25 @@ fn adpcm_mode_encodes_aac() {
         assert_eq!(name, "MPEG4-GENERIC");
         assert_eq!(rate, 8000);
     }
+}
+
+#[test]
+fn aac_track_is_mono() {
+    // A stereo camera track is mixed down before the encoder, so the AAC
+    // track is mono at the 32 kbit/s the encoder is set to.
+    let branch = Branch::new(AudioType::Aac, AudioCodec::Aac);
+    branch.play(camera_aac_channels(40, 2), AAC_FRAME_NS);
+    let packets = branch.packets(5, Duration::from_secs(10));
+    assert_eq!(packets.len(), 5, "AAC packets from stereo AAC input");
+    let caps = branch
+        .element("audaacenc")
+        .expect("an AAC encoder")
+        .static_pad("sink")
+        .unwrap()
+        .current_caps()
+        .expect("negotiated encoder caps");
+    let channels = caps.structure(0).unwrap().get::<i32>("channels").unwrap();
+    assert_eq!(channels, 1, "encoder input caps {}", caps);
 }
 
 #[test]
