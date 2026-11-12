@@ -7,12 +7,13 @@ use std::time::{Duration, Instant};
 
 use gstreamer::{prelude::*, Bin, Buffer, ClockTime, Element, ElementFactory, Pipeline, Sample};
 use gstreamer_app::{AppSink, AppSrc};
+use neolink_core::bcmedia::model::{BcMedia, BcMediaAac};
 
 use super::factory::{
-    build_audio, build_audio_with, installed_aac_encoder, pick_aac_encoder, AudioType,
-    StreamConfig, AAC_ENCODERS,
+    build_audio, build_audio_for, build_audio_with, installed_aac_encoder, pick_aac_encoder,
+    AacFormat, AudioType, StreamConfig, AAC_ENCODERS,
 };
-use crate::config::AudioCodec;
+use crate::config::{AudioCodec, CameraConfig, Config};
 
 /// One AAC frame holds 1024 samples.
 const AAC_SAMPLES: u64 = 1024;
@@ -85,6 +86,18 @@ fn camera_dvi(blocks: u32) -> Vec<Buffer> {
     out
 }
 
+/// The stream config the factory has after it saw `aud` from the camera. For
+/// AAC it has read the format from a real ADTS frame, as `make_factory` does.
+fn learned(aud: &AudioType) -> StreamConfig {
+    let mut config = StreamConfig::for_test(15);
+    if let AudioType::Aac = aud {
+        let frame = camera_aac(1).remove(0);
+        let data = frame.map_readable().unwrap().as_slice().to_vec();
+        config.update_from_media(&BcMedia::Aac(BcMediaAac { data }));
+    }
+    config
+}
+
 /// The audio branch of one client pipeline, ended in an appsink after `pay1`.
 struct Branch {
     pipeline: Pipeline,
@@ -108,7 +121,7 @@ impl Branch {
             bin.upcast_ref(),
             Some(&aud),
             codec,
-            &StreamConfig::for_test(15),
+            &learned(&aud),
             aac_encoder,
         )
         .expect("the audio branch builds");
@@ -289,6 +302,7 @@ fn l16_mode_unchanged() {
     ];
     if branch.element("audfallbackswitch").is_some() {
         expected.push("audiotestsrc".to_string());
+        expected.push("capsfilter".to_string());
         expected.push("fallbackswitch".to_string());
     }
     expected.sort();
@@ -360,32 +374,151 @@ fn aac_encoder_prefers_voaacenc() {
     }
 }
 
+/// Needs `fallbackswitch` from gst-plugins-rs. Neither the estate-test job
+/// nor the Dockerfile installs it, so the test is ignored there and listed as
+/// ignored. Run it with `cargo test -- --ignored silence_fallback` on a host
+/// that has gst-plugins-rs.
 #[test]
+#[ignore = "needs fallbackswitch from gst-plugins-rs"]
 fn silence_fallback_stays_aac() {
+    init();
+    assert!(
+        ElementFactory::find("fallbackswitch").is_some(),
+        "fallbackswitch (gst-plugins-rs) is not installed, so this test cannot run"
+    );
     let branch = Branch::new(AudioType::Aac, AudioCodec::Aac);
-    if branch.element("audfallbackswitch").is_none() {
-        // fallbackswitch comes from gst-plugins-rs. Without it the factory
-        // builds no silence branch, so there is nothing to test here.
-        eprintln!("fallbackswitch (gst-plugins-rs) not installed: silence fallback not built");
-        return;
-    }
+    assert!(
+        branch.element("audfallbackswitch").is_some(),
+        "the factory built no silence fallback"
+    );
     branch.play(camera_aac(5), AAC_FRAME_NS);
     let stopped = Instant::now();
     // The camera sends nothing more. The switch falls back to silence after
-    // its 3 s timeout, and the track keeps going as AAC.
+    // its 3 s timeout, and the track keeps going as AAC at the rate the SDP
+    // announced, which is the camera's.
     let mut late = 0;
-    let deadline = stopped + Duration::from_secs(6);
+    let deadline = stopped + Duration::from_secs(8);
     while Instant::now() < deadline && late < 5 {
         for packet in branch.packets(1, Duration::from_secs(1)) {
-            assert_eq!(rtp_caps(&packet).0, "MPEG4-GENERIC");
-            if stopped.elapsed() >= Duration::from_secs(2) {
+            let (name, rate, _) = rtp_caps(&packet);
+            assert_eq!(name, "MPEG4-GENERIC");
+            assert_eq!(rate, AAC_RATE as i32, "the RTP clock rate changed");
+            if stopped.elapsed() >= Duration::from_secs(4) {
                 late += 1;
             }
         }
     }
     assert!(
         late >= 5,
-        "only {} AAC packets 2 s after the camera went quiet",
+        "only {} AAC packets 4 s after the camera went quiet",
         late
     );
+}
+
+#[test]
+fn aac_mode_with_avenc_aac() {
+    init();
+    if ElementFactory::find("avenc_aac").is_none() {
+        // The estate-test job checks avenc_aac is installed, so this runs
+        // only on a host without gst-libav.
+        eprintln!("avenc_aac (gst-libav) not installed: avenc_aac branch not run");
+        return;
+    }
+    for (aud, frames, frame_ns, rate) in [
+        (
+            AudioType::Aac,
+            camera_aac(40),
+            AAC_FRAME_NS,
+            AAC_RATE as i32,
+        ),
+        (
+            AudioType::Adpcm(DVI_BLOCK_ALIGN - 4),
+            camera_dvi(40),
+            DVI_FRAME_NS,
+            8000,
+        ),
+    ] {
+        let label = format!("{:?}", aud);
+        let branch = Branch::with(aud, AudioCodec::Aac, Some("avenc_aac"));
+        let encoder = branch.element("audaacenc").expect("an AAC encoder");
+        assert_eq!(encoder.factory().unwrap().name(), "avenc_aac");
+        branch.play(frames, frame_ns);
+        let packets = branch.packets(5, Duration::from_secs(10));
+        assert_eq!(packets.len(), 5, "avenc_aac packets from {}", label);
+        for packet in &packets {
+            let (name, clock, pt) = rtp_caps(packet);
+            assert_eq!(name, "MPEG4-GENERIC", "{}", label);
+            assert_eq!(clock, rate, "{}", label);
+            assert_eq!(pt, 97, "{}", label);
+        }
+    }
+}
+
+/// A camera config as the operator writes it, with `extra` lines.
+fn camera_config(extra: &str) -> CameraConfig {
+    let config: Config = toml::from_str(&format!(
+        "[[cameras]]\nname = \"cam\"\nusername = \"admin\"\naddress = \"192.0.2.1:9000\"\n{extra}\n"
+    ))
+    .unwrap();
+    config.cameras[0].clone()
+}
+
+#[test]
+fn audio_track_follows_camera_config() {
+    init();
+    let aac_pay = installed_aac_encoder().map(|_| "rtpmp4gpay");
+    for (extra, pay) in [
+        ("", aac_pay),
+        ("audio_codec = \"aac\"", aac_pay),
+        ("audio_codec = \"pcmu\"", Some("rtppcmupay")),
+        ("audio_codec = \"l16\"", Some("rtpL16pay")),
+        ("audio_codec = \"none\"", None),
+    ] {
+        let bin = Bin::new();
+        let src = build_audio_for(
+            bin.upcast_ref(),
+            &camera_config(extra),
+            &learned(&AudioType::Aac),
+        )
+        .unwrap();
+        let built = bin
+            .by_name("pay1")
+            .map(|e| e.factory().unwrap().name().to_string());
+        assert_eq!(built.as_deref(), pay, "config `{}`", extra);
+        assert_eq!(src.is_some(), pay.is_some(), "config `{}`", extra);
+    }
+}
+
+#[test]
+fn adts_header_gives_rate_and_channels() {
+    for channels in [1, 2] {
+        let frame = camera_aac_channels(1, channels).remove(0);
+        let data = frame.map_readable().unwrap().as_slice().to_vec();
+        assert_eq!(
+            AacFormat::from_adts(&data),
+            Some(AacFormat {
+                rate: AAC_RATE as i32,
+                channels: channels as i32
+            })
+        );
+    }
+    // 0xFFF1, then index 11 (8000 Hz) and channel configuration 7 (8 channels).
+    let header = [0xff, 0xf1, (11 << 2) | 0x01, 0xc0, 0, 0, 0];
+    assert_eq!(
+        AacFormat::from_adts(&header),
+        Some(AacFormat {
+            rate: 8000,
+            channels: 8
+        })
+    );
+    let mut bad_sync = header;
+    bad_sync[1] = 0xe1;
+    let mut bad_index = header;
+    bad_index[2] = (13 << 2) | 0x01;
+    let mut pce = header;
+    pce[2] = 11 << 2;
+    pce[3] = 0;
+    for bad in [&bad_sync[..], &bad_index[..], &pce[..], &header[..6], &[]] {
+        assert_eq!(AacFormat::from_adts(bad), None, "{:02x?}", bad);
+    }
 }

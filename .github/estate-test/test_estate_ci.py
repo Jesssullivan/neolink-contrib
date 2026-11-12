@@ -39,7 +39,7 @@ REQUIRED_APT = [
     "gstreamer1.0-libav",
     "protobuf-compiler",
 ]
-REQUIRED_ELEMENTS = ["voaacenc", "faad", "aacparse", "rtpmp4gpay"]
+REQUIRED_ELEMENTS = ["voaacenc", "avenc_aac", "faad", "aacparse", "rtpmp4gpay"]
 
 # Output in the shape cargo and libtest print it, stdout and stderr combined.
 CARGO_OK = """\
@@ -256,7 +256,7 @@ class GstElementCheck(unittest.TestCase):
         self.assertIn("| `voaacenc` | voaacencplug | 1.24.2 |", r.summary)
 
     def test_missing_element_fails_and_names_it(self):
-        r = self.run_check(["faad", "aacparse", "rtpmp4gpay"], REQUIRED_ELEMENTS)
+        r = self.run_check(["avenc_aac", "faad", "aacparse", "rtpmp4gpay"], REQUIRED_ELEMENTS)
         self.assertEqual(r.returncode, 1)
         self.assertIn("missing voaacenc", r.stderr)
         self.assertIn("| `voaacenc` | missing | |", r.summary)
@@ -274,7 +274,7 @@ GATING_STEPS = {
         "run": "python3 -m unittest discover -s .github/estate-test -p 'test_*.py' -v",
     },
     ("estate-test", "GStreamer elements"): {
-        "run": "bash .github/estate-test/check_gst_elements.sh voaacenc faad aacparse rtpmp4gpay",
+        "run": "bash .github/estate-test/check_gst_elements.sh voaacenc avenc_aac faad aacparse rtpmp4gpay",
     },
     ("estate-test", "cargo test"): {
         # An explicit bash shell runs with -o pipefail, so tee cannot hide a cargo failure.

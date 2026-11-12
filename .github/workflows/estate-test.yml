@@ -52,7 +52,7 @@ jobs:
         run: python3 -m unittest discover -s .github/estate-test -p 'test_*.py' -v
 
       - name: GStreamer elements
-        run: bash .github/estate-test/check_gst_elements.sh voaacenc faad aacparse rtpmp4gpay
+        run: bash .github/estate-test/check_gst_elements.sh voaacenc avenc_aac faad aacparse rtpmp4gpay
 
       - name: Install Rust ${{ env.rust_version }}
         run: |

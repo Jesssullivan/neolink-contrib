@@ -14,7 +14,7 @@ use tokio::{sync::mpsc::channel as mpsc, task::JoinHandle};
 
 use crate::{
     common::NeoInstance,
-    config::AudioCodec,
+    config::{AudioCodec, CameraConfig},
     rtsp::gst::{MediaKey, NeoMediaFactory},
     AnyResult,
 };
@@ -23,6 +23,50 @@ use crate::{
 pub enum AudioType {
     Aac,
     Adpcm(u32),
+}
+
+/// Sample rate and channel count of the camera's AAC, read from the ADTS
+/// header of a frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct AacFormat {
+    pub(super) rate: i32,
+    pub(super) channels: i32,
+}
+
+impl AacFormat {
+    /// Reads the fixed ADTS header (ISO/IEC 14496-3, 1.A.2.2.1): a 12 bit
+    /// syncword, then at bit 18 the 4 bit sampling frequency index and at
+    /// bit 23 the 3 bit channel configuration. Returns `None` for anything
+    /// else, and for an index or configuration that does not name a fixed
+    /// rate or channel count.
+    pub(super) fn from_adts(data: &[u8]) -> Option<Self> {
+        if data.len() < 7 || data[0] != 0xff || data[1] & 0xf0 != 0xf0 {
+            return None;
+        }
+        let rate = match (data[2] >> 2) & 0x0f {
+            0 => 96000,
+            1 => 88200,
+            2 => 64000,
+            3 => 48000,
+            4 => 44100,
+            5 => 32000,
+            6 => 24000,
+            7 => 22050,
+            8 => 16000,
+            9 => 12000,
+            10 => 11025,
+            11 => 8000,
+            12 => 7350,
+            _ => return None,
+        };
+        let channels = match ((data[2] & 0x01) << 2) | (data[3] >> 6) {
+            // 0 means the layout is in a program config element instead.
+            0 => return None,
+            7 => 8,
+            n => n as i32,
+        };
+        Some(Self { rate, channels })
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -35,6 +79,7 @@ pub(super) struct StreamConfig {
     fps_table: Vec<u32>,
     vid_type: Option<VideoType>,
     aud_type: Option<AudioType>,
+    aac_format: Option<AacFormat>,
 }
 impl StreamConfig {
     async fn new(instance: &NeoInstance, name: StreamKind) -> AnyResult<Self> {
@@ -97,6 +142,7 @@ impl StreamConfig {
             bitrate_table,
             vid_type: None,
             aud_type: None,
+            aac_format: None,
         })
     }
 
@@ -111,6 +157,7 @@ impl StreamConfig {
             fps_table: vec![],
             vid_type: None,
             aud_type: None,
+            aac_format: None,
         }
     }
 
@@ -128,12 +175,15 @@ impl StreamConfig {
         self.bitrate = new_bitrate;
     }
 
-    fn update_from_media(&mut self, media: &BcMedia) {
+    pub(super) fn update_from_media(&mut self, media: &BcMedia) {
         match media {
             BcMedia::InfoV1(BcMediaInfoV1 { fps, .. })
             | BcMedia::InfoV2(BcMediaInfoV2 { fps, .. }) => self.update_fps(*fps as u32),
-            BcMedia::Aac(_) => {
+            BcMedia::Aac(aac) => {
                 self.aud_type = Some(AudioType::Aac);
+                if let Some(format) = AacFormat::from_adts(&aac.data) {
+                    self.aac_format = Some(format);
+                }
             }
             BcMedia::Adpcm(adpcm) => {
                 self.aud_type = Some(AudioType::Adpcm(adpcm.block_size()));
@@ -355,13 +405,8 @@ pub(super) async fn make_factory(
                         }?;
 
                         // Build the right audio pipeline
-                        let audio_codec = camera.config().await?.borrow().audio_codec;
-                        let aud_src = build_audio(
-                            &element,
-                            stream_config.aud_type.as_ref(),
-                            audio_codec,
-                            &stream_config,
-                        )?;
+                        let camera_config = camera.config().await?.borrow().clone();
+                        let aud_src = build_audio_for(&element, &camera_config, &stream_config)?;
 
                         if let Some(app) = vid_src.as_ref() {
                             app.set_callbacks(
@@ -1209,20 +1254,41 @@ fn pipe_aac(bin: &Element, stream_config: &StreamConfig) -> Result<Linked> {
         Err(_) => make_element("avdec_aac", "auddecoder_avdec_aac"),
     }?;
 
-    // The fallback
-    let silence = make_element("audiotestsrc", "audsilence")?;
-    silence.set_property_from_str("wave", "silence");
-    let fallback_switch = make_element("fallbackswitch", "audfallbackswitch");
-    if let Ok(fallback_switch) = fallback_switch.as_ref() {
-        fallback_switch.set_property("timeout", 3u64 * 1_000_000_000u64);
-        fallback_switch.set_property("immediate-fallback", true);
-    }
+    // The fallback. The silence is pinned to the camera's rate and channel
+    // count. Unpinned, audiotestsrc picks its own rate, 44100 Hz by default,
+    // and the encoder would take it, so the RTP clock rate would differ from
+    // the one in the SDP. Without the camera's format there is no fallback.
+    let fallback = match (
+        make_element("fallbackswitch", "audfallbackswitch"),
+        stream_config.aac_format,
+    ) {
+        (Ok(fallback_switch), Some(format)) => {
+            fallback_switch.set_property("timeout", 3u64 * 1_000_000_000u64);
+            fallback_switch.set_property("immediate-fallback", true);
+            let silence = make_element("audiotestsrc", "audsilence")?;
+            silence.set_property_from_str("wave", "silence");
+            let silence_caps = make_element("capsfilter", "audsilencecaps")?;
+            silence_caps.set_property(
+                "caps",
+                Caps::builder("audio/x-raw")
+                    .field("rate", format.rate)
+                    .field("channels", format.channels)
+                    .build(),
+            );
+            Some((fallback_switch, silence, silence_caps))
+        }
+        (Ok(_), None) => {
+            log::warn!("The camera's AAC format is unknown, so the audio has no silence fallback");
+            None
+        }
+        (Err(_), _) => None,
+    };
 
     let encoder = make_element("audioconvert", "audencoder")?;
 
     bin.add_many([&source, &queue, &parser, &decoder, &encoder])?;
-    if let Ok(fallback_switch) = fallback_switch.as_ref() {
-        bin.add_many([&silence, fallback_switch])?;
+    if let Some((fallback_switch, silence, silence_caps)) = fallback.as_ref() {
+        bin.add_many([silence, silence_caps, fallback_switch])?;
         Element::link_many([
             &source,
             &queue,
@@ -1231,7 +1297,7 @@ fn pipe_aac(bin: &Element, stream_config: &StreamConfig) -> Result<Linked> {
             fallback_switch,
             &encoder,
         ])?;
-        Element::link_many([&silence, fallback_switch])?;
+        Element::link_many([silence, silence_caps, fallback_switch])?;
     } else {
         Element::link_many([&source, &queue, &parser, &decoder, &encoder])?;
     }
@@ -1347,6 +1413,21 @@ pub(super) fn build_audio(
     stream_config: &StreamConfig,
 ) -> Result<Option<AppSrc>> {
     build_audio_with(bin, aud_type, codec, stream_config, installed_aac_encoder())
+}
+
+/// Builds the audio branch in the codec that `camera` names, for the audio
+/// that `stream_config` learned from the camera.
+pub(super) fn build_audio_for(
+    bin: &Element,
+    camera: &CameraConfig,
+    stream_config: &StreamConfig,
+) -> Result<Option<AppSrc>> {
+    build_audio(
+        bin,
+        stream_config.aud_type.as_ref(),
+        camera.audio_codec,
+        stream_config,
+    )
 }
 
 /// `build_audio` with the AAC encoder given, so a test can take it away.

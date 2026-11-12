@@ -46,10 +46,14 @@ Each camera now takes an `audio_codec` key:
 | `none` | no audio track | |
 
 AAC and ADPCM cameras both work in every mode. The audio is always encoded
-again. With `fallbackswitch` from gst-plugins-rs installed, an AAC camera's
-track falls back to silence in the chosen codec when the camera's audio stops.
-With `aac` and no AAC encoder installed, the stream is served with video only
-and the log names the missing plugin.
+again. With `aac` and no AAC encoder installed, the stream is served with
+video only and the log names the missing plugin.
+
+With `fallbackswitch` from gst-plugins-rs installed, an AAC camera's track
+falls back to silence at the camera's rate when the camera's audio stops.
+This is unverified in CI. The CI job and the Dockerfile do not install
+gst-plugins-rs, so `silence_fallback_stays_aac` is an ignored test. Run it with
+`cargo test -- --ignored silence_fallback` on a host that has the plugin.
 
 ## Installation
 
