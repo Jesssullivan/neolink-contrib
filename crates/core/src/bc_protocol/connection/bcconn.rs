@@ -39,6 +39,10 @@ pub struct BcConnection {
     poll_commander: Sender<PollCommand>,
     rx_thread: RwLock<JoinSet<Result<()>>>,
     cancel: CancellationToken,
+    /// Test only. `subscribe_to_id` waits this long before it queues the
+    /// subscription, so a test can make the subscriber slow on any runtime.
+    #[cfg(test)]
+    pub(crate) subscribe_to_id_delay: Option<std::time::Duration>,
 }
 
 impl BcConnection {
@@ -100,6 +104,8 @@ impl BcConnection {
             poll_commander,
             rx_thread: RwLock::new(rx_thread),
             cancel,
+            #[cfg(test)]
+            subscribe_to_id_delay: None,
         })
     }
 
@@ -146,6 +152,10 @@ impl BcConnection {
     ///
     /// This function creates a temporary handle to grab this single message
     pub async fn subscribe_to_id(&self, msg_id: u32) -> Result<BcSubscription> {
+        #[cfg(test)]
+        if let Some(delay) = self.subscribe_to_id_delay {
+            tokio::time::sleep(delay).await;
+        }
         let (tx, rx) = channel(100);
         self.poll_commander
             .send(PollCommand::AddSubscriber(msg_id, None, tx))
