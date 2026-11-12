@@ -1269,6 +1269,10 @@ fn pipe_adpcm(bin: &Element, block_size: u32, stream_config: &StreamConfig) -> R
     source.set_max_bytes(buffer_size as u64);
     source.set_do_timestamp(false);
     source.set_stream_type(AppStreamType::Stream);
+    // adpcmdec is a GstAudioDecoder, which fails on a BYTES segment, the
+    // appsrc default. The buffers carry presentation times, so the segment
+    // is in time.
+    source.set_format(gstreamer::Format::Time);
 
     // The camera sends one DVI block per frame: the 4 byte predictor header
     // then `block_size` bytes of samples. GStreamer's block_align counts the
