@@ -2,6 +2,7 @@ use super::{BcCamera, Error, Result};
 use crate::bc::{model::*, xml::*};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{channel, error::TryRecvError, Receiver};
+use tokio::sync::oneshot;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
@@ -204,8 +205,6 @@ impl BcCamera {
     /// This returns a data structure which can be used to
     /// query motion events
     pub async fn listen_on_motion(&self) -> Result<MotionData> {
-        self.start_motion_query().await?;
-
         let connection = self.get_connection();
 
         // After start_motion_query (MSG_ID 31) the camera sends motion messages
@@ -216,11 +215,13 @@ impl BcCamera {
         let channel_id = self.channel_id;
         let cancel = CancellationToken::new();
         let thread_cancel = cancel.clone();
+        let (subscribed_tx, subscribed_rx) = oneshot::channel();
         set.spawn(async move {
             tokio::select! {
                 _ = thread_cancel.cancelled() => Result::Ok(()),
                 v = async {
                     let mut sub = connection.subscribe_to_id(MSG_ID_MOTION).await?;
+                    let _ = subscribed_tx.send(());
 
                     loop {
                         tokio::task::yield_now().await;
@@ -273,6 +274,17 @@ impl BcCamera {
             }
         });
 
+        // The message 33 subscriber must exist before message 31 is sent.
+        // A message 33 that reaches the connection with no subscriber is
+        // dropped, and the camera may send one right behind its reply.
+        if subscribed_rx.await.is_err() {
+            return Err(match set.join_next().await {
+                Some(Ok(Err(e))) => e,
+                _ => Error::DroppedSubscriber,
+            });
+        }
+        self.start_motion_query().await?;
+
         Ok(MotionData {
             handle: set,
             cancel,
@@ -292,5 +304,125 @@ impl Drop for MotionData {
             while handle.join_next().await.is_some() {}
             log::trace!("Dropped MotionData");
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! An in-process fake camera: no network and no real device. The alarm
+    //! XML is SYNTHETIC, written by hand to the field names of [`AlarmEvent`].
+    use super::*;
+    use crate::bc_protocol::{BcConnSink, BcConnSource, BcConnection, Credentials, ReadKind};
+    use futures::{channel::mpsc::unbounded, SinkExt, StreamExt};
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicBool, AtomicU16};
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
+    use tokio::time::timeout;
+
+    const CHANNEL: u8 = 0;
+
+    /// A message 33 that reports motion and a person on [`CHANNEL`].
+    fn alarm_frame() -> Bc {
+        Bc::new_from_xml(
+            BcMeta {
+                msg_id: MSG_ID_MOTION,
+                channel_id: CHANNEL,
+                msg_num: 0,
+                stream_type: 0,
+                response_code: 0,
+                class: 0x0000,
+            },
+            BcXml {
+                alarm_event_list: Some(AlarmEventList {
+                    version: "1.1".to_string(),
+                    alarm_events: vec![AlarmEvent {
+                        version: "1.1".to_string(),
+                        channel_id: CHANNEL,
+                        status: "MD".to_string(),
+                        ai_type: Some("people".to_string()),
+                        recording: 0,
+                        timeStamp: 0,
+                    }],
+                }),
+                ..Default::default()
+            },
+        )
+    }
+
+    /// A camera that answers message 31 with 200 and sends one alarm right
+    /// behind the reply, in the same burst. A real camera may do this when
+    /// motion is already under way as the request lands.
+    async fn camera_with_early_alarm() -> BcCamera {
+        let (to_cam, mut cam_rx) = unbounded::<Bc>();
+        let (cam_tx, from_cam) = unbounded::<Result<Bc>>();
+        tokio::spawn(async move {
+            while let Some(request) = cam_rx.next().await {
+                if request.meta.msg_id == MSG_ID_MOTION_REQUEST {
+                    let reply = Bc {
+                        meta: BcMeta {
+                            response_code: 200,
+                            ..request.meta
+                        },
+                        body: BcBody::ModernMsg(ModernMsg::default()),
+                    };
+                    let _ = cam_tx.unbounded_send(Ok(reply));
+                    let _ = cam_tx.unbounded_send(Ok(alarm_frame()));
+                }
+            }
+        });
+        let sink: BcConnSink =
+            Box::new(to_cam.sink_map_err(|_| Error::Other("fake camera is gone")));
+        let source: BcConnSource = Box::new(from_cam);
+        let connection = BcConnection::new(sink, source)
+            .await
+            .expect("in-memory connection");
+        let mut abilities = HashMap::new();
+        abilities.insert("motion".to_string(), ReadKind::ReadWrite);
+        BcCamera {
+            channel_id: CHANNEL,
+            connection: Arc::new(connection),
+            logged_in: AtomicBool::new(true),
+            message_num: AtomicU16::new(0),
+            credentials: Credentials::new("fake", None::<String>),
+            abilities: RwLock::new(abilities),
+            cancel: CancellationToken::new(),
+        }
+    }
+
+    /// TIN-8227: an alarm that arrives right after the message 31 reply
+    /// reaches `listen_on_motion`.
+    #[tokio::test]
+    async fn motion_keeps_alarm_sent_with_the_request_reply() {
+        let camera = camera_with_early_alarm().await;
+        let mut motion = camera.listen_on_motion().await.expect("motion started");
+
+        let first = timeout(Duration::from_secs(2), motion.next_motion()).await;
+
+        assert!(
+            matches!(first, Ok(Ok(MotionStatus::Start(_)))),
+            "the alarm sent right after the message 31 reply was lost: {:?}",
+            first
+        );
+    }
+
+    /// TIN-8227: the same early alarm reaches `listen_on_alarms` unchanged.
+    #[tokio::test]
+    async fn alarms_keep_alarm_sent_with_the_request_reply() {
+        let camera = camera_with_early_alarm().await;
+        let mut alarms = camera.listen_on_alarms().await.expect("alarms started");
+
+        let first = timeout(Duration::from_secs(2), alarms.next_alarm()).await;
+
+        match first {
+            Ok(Ok(event)) => {
+                assert_eq!(event.status, "MD");
+                assert_eq!(event.ai_type.as_deref(), Some("people"));
+            }
+            other => panic!(
+                "the alarm sent right after the message 31 reply was lost: {:?}",
+                other
+            ),
+        }
     }
 }

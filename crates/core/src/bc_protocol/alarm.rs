@@ -1,6 +1,7 @@
 use super::{BcCamera, Error, Result};
 use crate::bc::{model::*, xml::*};
 use tokio::sync::mpsc::{channel, error::TryRecvError, Receiver};
+use tokio::sync::oneshot;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
@@ -79,8 +80,6 @@ impl BcCamera {
     /// [`BcCamera::listen_on_motion`] cannot run at the same time on one
     /// camera connection: the second gets `Error::SimultaneousSubscription`.
     pub async fn listen_on_alarms(&self) -> Result<AlarmData> {
-        self.start_motion_query().await?;
-
         let connection = self.get_connection();
 
         // After start_motion_query (MSG_ID 31) the camera sends alarm
@@ -91,11 +90,13 @@ impl BcCamera {
         let channel_id = self.channel_id;
         let cancel = CancellationToken::new();
         let thread_cancel = cancel.clone();
+        let (subscribed_tx, subscribed_rx) = oneshot::channel();
         set.spawn(async move {
             tokio::select! {
                 _ = thread_cancel.cancelled() => Result::Ok(()),
                 v = async {
                     let mut sub = connection.subscribe_to_id(MSG_ID_MOTION).await?;
+                    let _ = subscribed_tx.send(());
 
                     loop {
                         tokio::task::yield_now().await;
@@ -118,6 +119,17 @@ impl BcCamera {
                 } => v,
             }
         });
+
+        // The message 33 subscriber must exist before message 31 is sent.
+        // A message 33 that reaches the connection with no subscriber is
+        // dropped, and the camera may send one right behind its reply.
+        if subscribed_rx.await.is_err() {
+            return Err(match set.join_next().await {
+                Some(Ok(Err(e))) => e,
+                _ => Error::DroppedSubscriber,
+            });
+        }
+        self.start_motion_query().await?;
 
         Ok(AlarmData {
             handle: set,
