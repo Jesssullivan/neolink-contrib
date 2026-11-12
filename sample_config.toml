@@ -58,6 +58,15 @@ address = "192.168.1.187:9000"
 # If your device has user connection limits try a single stream instead.
 # stream = "mainStream"
 
+# Codec of the RTSP audio track. The camera's audio is decoded and encoded
+# again in this codec. The default is "aac", because ONVIF recorders accept
+# only AAC or G.711 and Home Assistant keeps only AAC.
+#   "aac"  AAC-LC mono, needs voaacenc (gst-plugins-bad) or avenc_aac (gst-libav)
+#   "pcmu" G.711 mu-law, 8000 Hz mono
+#   "l16"  raw 16 bit PCM, what earlier releases always served
+#   "none" no audio track
+# audio_codec = "aac"
+
 # By default neolink will use any means to connect to the camera
 # from a UID
 # This include relaying via reolink servers

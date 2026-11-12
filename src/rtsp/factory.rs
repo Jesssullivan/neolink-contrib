@@ -14,6 +14,7 @@ use tokio::{sync::mpsc::channel as mpsc, task::JoinHandle};
 
 use crate::{
     common::NeoInstance,
+    config::{AudioCodec, CameraConfig},
     rtsp::gst::{MediaKey, NeoMediaFactory},
     AnyResult,
 };
@@ -24,8 +25,52 @@ pub enum AudioType {
     Adpcm(u32),
 }
 
+/// Sample rate and channel count of the camera's AAC, read from the ADTS
+/// header of a frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct AacFormat {
+    pub(super) rate: i32,
+    pub(super) channels: i32,
+}
+
+impl AacFormat {
+    /// Reads the fixed ADTS header (ISO/IEC 14496-3, 1.A.2.2.1): a 12 bit
+    /// syncword, then at bit 18 the 4 bit sampling frequency index and at
+    /// bit 23 the 3 bit channel configuration. Returns `None` for anything
+    /// else, and for an index or configuration that does not name a fixed
+    /// rate or channel count.
+    pub(super) fn from_adts(data: &[u8]) -> Option<Self> {
+        if data.len() < 7 || data[0] != 0xff || data[1] & 0xf0 != 0xf0 {
+            return None;
+        }
+        let rate = match (data[2] >> 2) & 0x0f {
+            0 => 96000,
+            1 => 88200,
+            2 => 64000,
+            3 => 48000,
+            4 => 44100,
+            5 => 32000,
+            6 => 24000,
+            7 => 22050,
+            8 => 16000,
+            9 => 12000,
+            10 => 11025,
+            11 => 8000,
+            12 => 7350,
+            _ => return None,
+        };
+        let channels = match ((data[2] & 0x01) << 2) | (data[3] >> 6) {
+            // 0 means the layout is in a program config element instead.
+            0 => return None,
+            7 => 8,
+            n => n as i32,
+        };
+        Some(Self { rate, channels })
+    }
+}
+
 #[derive(Clone, Debug)]
-struct StreamConfig {
+pub(super) struct StreamConfig {
     #[allow(dead_code)]
     resolution: [u32; 2],
     bitrate: u32,
@@ -34,6 +79,7 @@ struct StreamConfig {
     fps_table: Vec<u32>,
     vid_type: Option<VideoType>,
     aud_type: Option<AudioType>,
+    aac_format: Option<AacFormat>,
 }
 impl StreamConfig {
     async fn new(instance: &NeoInstance, name: StreamKind) -> AnyResult<Self> {
@@ -96,7 +142,23 @@ impl StreamConfig {
             bitrate_table,
             vid_type: None,
             aud_type: None,
+            aac_format: None,
         })
+    }
+
+    /// A config for a pipeline test that has no camera to ask.
+    #[cfg(test)]
+    pub(super) fn for_test(fps: u32) -> Self {
+        StreamConfig {
+            resolution: [0, 0],
+            bitrate: 0,
+            fps,
+            bitrate_table: vec![],
+            fps_table: vec![],
+            vid_type: None,
+            aud_type: None,
+            aac_format: None,
+        }
     }
 
     fn update_fps(&mut self, fps: u32) {
@@ -113,12 +175,15 @@ impl StreamConfig {
         self.bitrate = new_bitrate;
     }
 
-    fn update_from_media(&mut self, media: &BcMedia) {
+    pub(super) fn update_from_media(&mut self, media: &BcMedia) {
         match media {
             BcMedia::InfoV1(BcMediaInfoV1 { fps, .. })
             | BcMedia::InfoV2(BcMediaInfoV2 { fps, .. }) => self.update_fps(*fps as u32),
-            BcMedia::Aac(_) => {
+            BcMedia::Aac(aac) => {
                 self.aud_type = Some(AudioType::Aac);
+                if let Some(format) = AacFormat::from_adts(&aac.data) {
+                    self.aac_format = Some(format);
+                }
             }
             BcMedia::Adpcm(adpcm) => {
                 self.aud_type = Some(AudioType::Adpcm(adpcm.block_size()));
@@ -340,17 +405,8 @@ pub(super) async fn make_factory(
                         }?;
 
                         // Build the right audio pipeline
-                        let aud_src = match stream_config.aud_type.as_ref() {
-                            Some(AudioType::Aac) => {
-                                let src = build_aac(&element, &stream_config)?;
-                                AnyResult::Ok(Some(src))
-                            }
-                            Some(AudioType::Adpcm(block_size)) => {
-                                let src = build_adpcm(&element, *block_size, &stream_config)?;
-                                AnyResult::Ok(Some(src))
-                            }
-                            None => AnyResult::Ok(None),
-                        }?;
+                        let camera_config = camera.config().await?.borrow().clone();
+                        let aud_src = build_audio_for(&element, &camera_config, &stream_config)?;
 
                         if let Some(app) = vid_src.as_ref() {
                             app.set_callbacks(
@@ -1198,20 +1254,41 @@ fn pipe_aac(bin: &Element, stream_config: &StreamConfig) -> Result<Linked> {
         Err(_) => make_element("avdec_aac", "auddecoder_avdec_aac"),
     }?;
 
-    // The fallback
-    let silence = make_element("audiotestsrc", "audsilence")?;
-    silence.set_property_from_str("wave", "silence");
-    let fallback_switch = make_element("fallbackswitch", "audfallbackswitch");
-    if let Ok(fallback_switch) = fallback_switch.as_ref() {
-        fallback_switch.set_property("timeout", 3u64 * 1_000_000_000u64);
-        fallback_switch.set_property("immediate-fallback", true);
-    }
+    // The fallback. The silence is pinned to the camera's rate and channel
+    // count. Unpinned, audiotestsrc picks its own rate, 44100 Hz by default,
+    // and the encoder would take it, so the RTP clock rate would differ from
+    // the one in the SDP. Without the camera's format there is no fallback.
+    let fallback = match (
+        make_element("fallbackswitch", "audfallbackswitch"),
+        stream_config.aac_format,
+    ) {
+        (Ok(fallback_switch), Some(format)) => {
+            fallback_switch.set_property("timeout", 3u64 * 1_000_000_000u64);
+            fallback_switch.set_property("immediate-fallback", true);
+            let silence = make_element("audiotestsrc", "audsilence")?;
+            silence.set_property_from_str("wave", "silence");
+            let silence_caps = make_element("capsfilter", "audsilencecaps")?;
+            silence_caps.set_property(
+                "caps",
+                Caps::builder("audio/x-raw")
+                    .field("rate", format.rate)
+                    .field("channels", format.channels)
+                    .build(),
+            );
+            Some((fallback_switch, silence, silence_caps))
+        }
+        (Ok(_), None) => {
+            log::warn!("The camera's AAC format is unknown, so the audio has no silence fallback");
+            None
+        }
+        (Err(_), _) => None,
+    };
 
     let encoder = make_element("audioconvert", "audencoder")?;
 
     bin.add_many([&source, &queue, &parser, &decoder, &encoder])?;
-    if let Ok(fallback_switch) = fallback_switch.as_ref() {
-        bin.add_many([&silence, fallback_switch])?;
+    if let Some((fallback_switch, silence, silence_caps)) = fallback.as_ref() {
+        bin.add_many([silence, silence_caps, fallback_switch])?;
         Element::link_many([
             &source,
             &queue,
@@ -1220,7 +1297,7 @@ fn pipe_aac(bin: &Element, stream_config: &StreamConfig) -> Result<Linked> {
             fallback_switch,
             &encoder,
         ])?;
-        Element::link_many([&silence, fallback_switch])?;
+        Element::link_many([silence, silence_caps, fallback_switch])?;
     } else {
         Element::link_many([&source, &queue, &parser, &decoder, &encoder])?;
     }
@@ -1232,20 +1309,6 @@ fn pipe_aac(bin: &Element, stream_config: &StreamConfig) -> Result<Linked> {
         appsrc: source,
         output: encoder,
     })
-}
-
-fn build_aac(bin: &Element, stream_config: &StreamConfig) -> Result<AppSrc> {
-    let linked = pipe_aac(bin, stream_config)?;
-
-    let bin = bin
-        .clone()
-        .dynamic_cast::<Bin>()
-        .map_err(|_| anyhow!("Media source's element should be a bin"))?;
-
-    let payload = make_element("rtpL16pay", "pay1")?;
-    bin.add_many([&payload])?;
-    Element::link_many([&linked.output, &payload])?;
-    Ok(linked.appsrc)
 }
 
 fn pipe_adpcm(bin: &Element, block_size: u32, stream_config: &StreamConfig) -> Result<Linked> {
@@ -1260,7 +1323,7 @@ fn pipe_adpcm(bin: &Element, block_size: u32, stream_config: &StreamConfig) -> R
     // ! queue silent=true max-size-bytes=10485760 min-threshold-bytes=1024
     // ! adpcmdec
     // ! audioconvert
-    // ! rtpL16pay name=pay1
+    // then the tail for the configured codec, see `audio_tail`
 
     let source = make_element("appsrc", "audsrc")?
         .dynamic_cast::<AppSrc>()
@@ -1272,11 +1335,18 @@ fn pipe_adpcm(bin: &Element, block_size: u32, stream_config: &StreamConfig) -> R
     source.set_max_bytes(buffer_size as u64);
     source.set_do_timestamp(false);
     source.set_stream_type(AppStreamType::Stream);
+    // adpcmdec is a GstAudioDecoder, which fails on a BYTES segment, the
+    // appsrc default. The buffers carry presentation times, so the segment
+    // is in time.
+    source.set_format(gstreamer::Format::Time);
 
+    // The camera sends one DVI block per frame: the 4 byte predictor header
+    // then `block_size` bytes of samples. GStreamer's block_align counts the
+    // header too.
     source.set_caps(Some(
         &Caps::builder("audio/x-adpcm")
-            .field("layout", "div")
-            .field("block_align", block_size as i32)
+            .field("layout", "dvi")
+            .field("block_align", (block_size + 4) as i32)
             .field("channels", 1i32)
             .field("rate", 8000i32)
             .build(),
@@ -1310,18 +1380,130 @@ fn pipe_adpcm(bin: &Element, block_size: u32, stream_config: &StreamConfig) -> R
     })
 }
 
-fn build_adpcm(bin: &Element, block_size: u32, stream_config: &StreamConfig) -> Result<AppSrc> {
-    let linked = pipe_adpcm(bin, block_size, stream_config)?;
+/// AAC encoders in order of preference. `voaacenc` comes from
+/// gst-plugins-bad. `avenc_aac` needs gst-libav and FFmpeg, so it is only the
+/// fallback.
+pub(super) const AAC_ENCODERS: [&str; 2] = ["voaacenc", "avenc_aac"];
 
+/// Bit rate of the AAC track. It fits AAC-LC mono at every rate the camera
+/// sends, 8000 Hz included.
+const AAC_BITRATE: &str = "32000";
+
+/// RTP payload type of the AAC track. Dynamic, and apart from the 96 that the
+/// video payloaders use.
+const AAC_PAYLOAD_TYPE: u32 = 97;
+
+/// The first AAC encoder in `AAC_ENCODERS` that `installed` reports.
+pub(super) fn pick_aac_encoder(installed: impl Fn(&str) -> bool) -> Option<&'static str> {
+    AAC_ENCODERS.iter().copied().find(|kind| installed(kind))
+}
+
+/// The AAC encoder this host's GStreamer registry offers, if any.
+pub(super) fn installed_aac_encoder() -> Option<&'static str> {
+    pick_aac_encoder(|kind| ElementFactory::find(kind).is_some())
+}
+
+/// Builds the audio branch of a client pipeline: the camera's AAC or ADPCM is
+/// decoded, then encoded in `codec` and payloaded as `pay1`. Returns `None`,
+/// with nothing added to the bin, when there is no audio track to serve.
+pub(super) fn build_audio(
+    bin: &Element,
+    aud_type: Option<&AudioType>,
+    codec: AudioCodec,
+    stream_config: &StreamConfig,
+) -> Result<Option<AppSrc>> {
+    build_audio_with(bin, aud_type, codec, stream_config, installed_aac_encoder())
+}
+
+/// Builds the audio branch in the codec that `camera` names, for the audio
+/// that `stream_config` learned from the camera.
+pub(super) fn build_audio_for(
+    bin: &Element,
+    camera: &CameraConfig,
+    stream_config: &StreamConfig,
+) -> Result<Option<AppSrc>> {
+    build_audio(
+        bin,
+        stream_config.aud_type.as_ref(),
+        camera.audio_codec,
+        stream_config,
+    )
+}
+
+/// `build_audio` with the AAC encoder given, so a test can take it away.
+pub(super) fn build_audio_with(
+    bin: &Element,
+    aud_type: Option<&AudioType>,
+    codec: AudioCodec,
+    stream_config: &StreamConfig,
+    aac_encoder: Option<&'static str>,
+) -> Result<Option<AppSrc>> {
+    let Some(aud_type) = aud_type else {
+        return Ok(None);
+    };
+    let aac_encoder = match (codec, aac_encoder) {
+        (AudioCodec::None, _) => return Ok(None),
+        (AudioCodec::Aac, None) => {
+            // Serving L16 instead would break clients that accept only AAC,
+            // so the stream goes out with video alone and says why.
+            log::error!(
+                "No AAC encoder: install voaacenc (gst-plugins-bad) or avenc_aac (gst-libav). Serving this stream without audio"
+            );
+            return Ok(None);
+        }
+        (_, encoder) => encoder,
+    };
+    let linked = match aud_type {
+        AudioType::Aac => pipe_aac(bin, stream_config)?,
+        AudioType::Adpcm(block_size) => pipe_adpcm(bin, *block_size, stream_config)?,
+    };
+    audio_tail(bin, &linked.output, codec, aac_encoder)?;
+    Ok(Some(linked.appsrc))
+}
+
+/// Encodes and payloads decoded audio from `input` in `codec`.
+fn audio_tail(
+    bin: &Element,
+    input: &Element,
+    codec: AudioCodec,
+    aac_encoder: Option<&'static str>,
+) -> Result<()> {
     let bin = bin
         .clone()
         .dynamic_cast::<Bin>()
         .map_err(|_| anyhow!("Media source's element should be a bin"))?;
 
-    let payload = make_element("rtpL16pay", "pay1")?;
-    bin.add_many([&payload])?;
-    Element::link_many([&linked.output, &payload])?;
-    Ok(linked.appsrc)
+    let chain = match codec {
+        AudioCodec::Aac => {
+            let kind = aac_encoder.ok_or_else(|| anyhow!("No AAC encoder installed"))?;
+            let resample = make_element("audioresample", "audresample")?;
+            let mono = make_element("capsfilter", "audcaps")?;
+            mono.set_property(
+                "caps",
+                Caps::builder("audio/x-raw").field("channels", 1i32).build(),
+            );
+            let encoder = make_element(kind, "audaacenc")?;
+            encoder.set_property_from_str("bitrate", AAC_BITRATE);
+            let parser = make_element("aacparse", "audaacparse")?;
+            let payload = make_element("rtpmp4gpay", "pay1")?;
+            payload.set_property("pt", AAC_PAYLOAD_TYPE);
+            vec![resample, mono, encoder, parser, payload]
+        }
+        AudioCodec::Pcmu => {
+            // rtppcmupay accepts only 8000 Hz mono, so caps negotiation makes
+            // audioresample and the audioconvert before it produce that.
+            let resample = make_element("audioresample", "audresample")?;
+            let encoder = make_element("mulawenc", "audmulawenc")?;
+            let payload = make_element("rtppcmupay", "pay1")?;
+            vec![resample, encoder, payload]
+        }
+        AudioCodec::L16 => vec![make_element("rtpL16pay", "pay1")?],
+        AudioCodec::None => return Ok(()),
+    };
+
+    bin.add_many(&chain)?;
+    Element::link_many(std::iter::once(input).chain(chain.iter()))?;
+    Ok(())
 }
 
 #[allow(dead_code)]
@@ -1435,6 +1617,14 @@ fn make_element(kind: &str, name: &str) -> AnyResult<Element> {
             "rtpjitterbuffer" => "rtp (gst-plugins-good)",
             "aacparse" => "audioparsers (gst-plugins-good)",
             "rtpL16pay" => "rtp (gst-plugins-good)",
+            "rtpmp4gpay" => "rtp (gst-plugins-good)",
+            "rtppcmupay" => "rtp (gst-plugins-good)",
+            "mulawenc" => "mulaw (gst-plugins-good)",
+            "voaacenc" => "voaacenc (gst-plugins-bad)",
+            "avenc_aac" => "libav (gst-libav)",
+            "faad" => "faad (gst-plugins-bad)",
+            "audioresample" => "audioresample (gst-plugins-base)",
+            "fallbackswitch" => "fallbackswitch (gst-plugins-rs)",
             "x264enc" => "x264 (gst-plugins-ugly)",
             "x265enc" => "x265 (gst-plugins-bad)",
             "avdec_h264" => "libav (gst-libav)",
