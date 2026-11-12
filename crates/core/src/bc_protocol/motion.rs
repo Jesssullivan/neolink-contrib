@@ -350,9 +350,19 @@ mod tests {
         )
     }
 
+    /// How long the fake connection holds back every message 33 subscription.
+    /// It stays well under the 2 second wait in the tests.
+    const SLOW_SUBSCRIBE: Duration = Duration::from_millis(300);
+
     /// A camera that answers message 31 with 200 and sends one alarm right
     /// behind the reply, in the same burst. A real camera may do this when
     /// motion is already under way as the request lands.
+    ///
+    /// The connection waits [`SLOW_SUBSCRIBE`] before it queues a
+    /// `subscribe_to_id` subscription. Message 31 then goes out before the
+    /// subscription exists unless the caller waits for the subscriber task.
+    /// A missing wait, or a signal sent before `subscribe_to_id` returns,
+    /// loses the alarm on every run and on any runtime.
     async fn camera_with_early_alarm() -> BcCamera {
         let (to_cam, mut cam_rx) = unbounded::<Bc>();
         let (cam_tx, from_cam) = unbounded::<Result<Bc>>();
@@ -374,9 +384,10 @@ mod tests {
         let sink: BcConnSink =
             Box::new(to_cam.sink_map_err(|_| Error::Other("fake camera is gone")));
         let source: BcConnSource = Box::new(from_cam);
-        let connection = BcConnection::new(sink, source)
+        let mut connection = BcConnection::new(sink, source)
             .await
             .expect("in-memory connection");
+        connection.subscribe_to_id_delay = Some(SLOW_SUBSCRIBE);
         let mut abilities = HashMap::new();
         abilities.insert("motion".to_string(), ReadKind::ReadWrite);
         BcCamera {
