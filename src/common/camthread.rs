@@ -202,9 +202,16 @@ async fn update_camera_time(camera: &BcCamera, name: &str, update_time: bool) ->
         if update_time {
             update = true;
         }
-    } else {
+    } else if update_time {
         update = true;
         log::warn!("{}: Camera has no time set, Updating", name);
+    } else {
+        // update_time = false means no write to the camera, even when its
+        // clock is unset.
+        log::warn!(
+            "{}: Camera has no time set. Leaving it, because update_time is false",
+            name
+        );
     }
     if update {
         use std::time::SystemTime;

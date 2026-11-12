@@ -67,6 +67,11 @@ address = "192.168.1.187:9000"
 #   "none" no audio track
 # audio_codec = "aac"
 
+# At each connect neolink reads the camera clock and logs it.
+# With update_time = true it also sets the camera clock to this computer's time.
+# With false, the default, it never writes the clock, even when the camera has none.
+# update_time = false
+
 # By default neolink will use any means to connect to the camera
 # from a UID
 # This include relaying via reolink servers
