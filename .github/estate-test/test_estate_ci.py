@@ -283,7 +283,7 @@ class RequiredTests(unittest.TestCase):
                     self.assertEqual(r.returncode, want, r.stdout + r.stderr)
 
     def test_workflow_names_every_resubscribe_test(self):
-        """The step names the four tests in src/rtsp/factory.rs, and each exists there."""
+        """The step names the five tests in src/rtsp/factory.rs, and each exists there."""
         source = (ROOT / "src/rtsp/factory.rs").read_text()
         self.assertIn("mod resubscribe_tests {", source)
         for t in RESUBSCRIBE_TESTS:
@@ -411,6 +411,7 @@ RESUBSCRIBE_TESTS = [
         "resubscribe_on_a_plain_thread_times_out_a_hung_attempt",
         "resubscribe_stops_once_the_client_has_gone",
         "resubscribe_to_a_gone_camera_retries_until_the_client_leaves",
+        "resubscribe_backoff_stops_at_its_max",
     )
 ]
 

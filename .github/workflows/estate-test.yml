@@ -97,6 +97,7 @@ jobs:
           --require-test rtsp::factory::resubscribe_tests::resubscribe_on_a_plain_thread_times_out_a_hung_attempt
           --require-test rtsp::factory::resubscribe_tests::resubscribe_stops_once_the_client_has_gone
           --require-test rtsp::factory::resubscribe_tests::resubscribe_to_a_gone_camera_retries_until_the_client_leaves
+          --require-test rtsp::factory::resubscribe_tests::resubscribe_backoff_stops_at_its_max
 
   actionlint:
     name: actionlint

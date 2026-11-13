@@ -1771,7 +1771,7 @@ mod watch_tests {
 /// no camera and no network, the way the pusher does after a camera drop.
 #[cfg(test)]
 mod resubscribe_tests {
-    use super::resubscribe;
+    use super::{resubscribe, RESUBSCRIBE_BACKOFF_MAX};
     use crate::common::{NeoCamCommand, NeoInstance};
     use anyhow::anyhow;
     use neolink_core::bc_protocol::{BcCamera, StreamKind};
@@ -1886,7 +1886,9 @@ mod resubscribe_tests {
     }
 
     /// The same call the pusher makes, `NeoInstance::stream_while_live`, on
-    /// an instance whose camera is gone, so every attempt fails at once.
+    /// an instance whose camera is gone, so every attempt fails at once. The
+    /// backoff before each check is what keeps the pusher from spinning while
+    /// the camera sleeps, so the test also checks that it slept and doubled.
     #[test]
     fn resubscribe_to_a_gone_camera_retries_until_the_client_leaves() {
         let rt = tokio::runtime::Runtime::new().unwrap();
@@ -1895,9 +1897,11 @@ mod resubscribe_tests {
         let (control_tx, control_rx) = tokio::sync::mpsc::channel::<NeoCamCommand>(1);
         drop(control_rx);
         let camera = NeoInstance::new(camera_watch, control_tx, CancellationToken::new()).unwrap();
+        let start = Duration::from_millis(10);
         let got = on_plain_thread(move || {
             let checks = AtomicUsize::new(0);
-            let mut backoff = NO_BACKOFF;
+            let mut backoff = start;
+            let started = Instant::now();
             let got = resubscribe(
                 &runtime,
                 &mut backoff,
@@ -1906,12 +1910,54 @@ mod resubscribe_tests {
                 || camera.stream_while_live(StreamKind::Main),
                 "test::mainStream",
             );
-            (got.is_some(), checks.load(Ordering::SeqCst))
+            (
+                got.is_some(),
+                checks.load(Ordering::SeqCst),
+                backoff,
+                started.elapsed(),
+            )
         });
+        let (got, checks, backoff, took) = got.expect("resubscribe ran without a panic");
         assert_eq!(
-            got,
-            Ok((false, 4)),
+            (got, checks),
+            (false, 4),
             "three failed attempts, then the client was gone"
+        );
+        // One sleep before each of the 4 checks: 10, 20, 40 and 80 ms.
+        assert_eq!(backoff, start * 16, "the backoff doubled once per check");
+        assert!(
+            took >= start * 15,
+            "slept before each check, took {:?}",
+            took
+        );
+    }
+
+    /// The backoff stops doubling at `RESUBSCRIBE_BACKOFF_MAX`, so a camera
+    /// that sleeps for hours is still tried every 10 seconds.
+    #[test]
+    fn resubscribe_backoff_stops_at_its_max() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let runtime = rt.handle().clone();
+        let got = on_plain_thread(move || {
+            let mut backoff = RESUBSCRIBE_BACKOFF_MAX;
+            let started = Instant::now();
+            let got: Option<()> = resubscribe(
+                &runtime,
+                &mut backoff,
+                Duration::from_secs(5),
+                || false,
+                || async { crate::AnyResult::Ok(()) },
+                "test::mainStream",
+            );
+            (got, backoff, started.elapsed())
+        });
+        let (got, backoff, took) = got.expect("resubscribe ran without a panic");
+        assert_eq!(got, None, "nobody watches, so no stream");
+        assert_eq!(backoff, RESUBSCRIBE_BACKOFF_MAX, "the backoff kept its max");
+        assert!(
+            took >= RESUBSCRIBE_BACKOFF_MAX,
+            "slept the max, took {:?}",
+            took
         );
     }
 }
