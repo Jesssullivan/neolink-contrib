@@ -324,6 +324,20 @@ class NoTestUtilCheck(unittest.TestCase):
         )
         self.assertNotIn("test-util", manifest["dependencies"]["neolink_core"].get("features", []))
 
+    def test_test_util_module_is_gated(self):
+        """The fake camera module compiles only with the test-util feature."""
+        lines = [
+            line.strip()
+            for line in (ROOT / "crates/core/src/bc_protocol.rs").read_text().splitlines()
+        ]
+        self.assertEqual(lines.count("pub mod test_util;"), 1)
+        i = lines.index("pub mod test_util;")
+        self.assertEqual(lines[i - 1], '#[cfg(feature = "test-util")]')
+        with open(ROOT / "crates/core/Cargo.toml", "rb") as fh:
+            features = tomllib.load(fh)["features"]
+        self.assertEqual(features["test-util"], [])
+        self.assertNotIn("test-util", features.get("default", []))
+
 
 # Every step whose exit status decides whether estate-test passes, with the exact
 # keys it may carry. A run is compared after collapsing whitespace, so only
