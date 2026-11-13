@@ -8,11 +8,14 @@ non-zero when:
 
 - the output holds no `test result:` line at all,
 - any test binary reports a failed test or a `FAILED` result,
-- a crate named with `--require` ran fewer than `--min` passing tests.
+- a crate named with `--require` ran fewer than `--min` passing tests,
+- a test named with `--require-test` has no `ok` line.
 
 The last rule is the check `estate_test_job_runs_core_tests`: the job must
 run at least one test from `neolink_core`, so a change that stops the core
-tests from running cannot pass the job.
+tests from running cannot pass the job. `--require-test` names one test by
+its full path, so a change that renames, gates or ignores that test fails
+the job too.
 
 Grammar read, from cargo and libtest:
 
@@ -20,6 +23,10 @@ Grammar read, from cargo and libtest:
     Running tests/foo.rs (target\\debug\\deps\\foo-0a1b2c3d.exe)
     Doc-tests neolink_core
     running 3 tests
+    test rtsp::factory::tests::one ... ok
+    test bc::de::tests::two ... FAILED
+    test bc::de::tests::three ... ignored, needs a camera
+    test crates/core/src/lib.rs - (line 10) ... ok
     test result: ok. 3 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.01s
     test result: FAILED. 2 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
 """
@@ -40,6 +47,9 @@ RESULT = re.compile(
     r"(?P<passed>\d+) passed; (?P<failed>\d+) failed; (?P<ignored>\d+) ignored"
 )
 HASH_SUFFIX = re.compile(r"-[0-9a-f]{8,}$")
+# One result line per test. Doc test names hold spaces, so the name runs up to
+# the last ` ... ` before the outcome.
+TEST_LINE = re.compile(r"^test (?P<name>.+) \.\.\. (?P<outcome>ok|FAILED|ignored)(?:, .*)?$")
 
 
 @dataclass
@@ -55,6 +65,7 @@ class Counts:
 class Summary:
     crates: dict[str, Counts] = field(default_factory=dict)
     results: int = 0
+    tests: dict[str, list[str]] = field(default_factory=dict)
 
     def add(self, crate: str, status: str, passed: int, failed: int, ignored: int) -> None:
         c = self.crates.setdefault(crate, Counts())
@@ -88,6 +99,10 @@ def parse(text: str) -> Summary:
         if m:
             current = m.group("crate").replace("-", "_")
             continue
+        m = TEST_LINE.match(line.strip())
+        if m:
+            summary.tests.setdefault(m.group("name"), []).append(m.group("outcome"))
+            continue
         m = RESULT.match(line.strip())
         if m:
             summary.add(
@@ -100,7 +115,9 @@ def parse(text: str) -> Summary:
     return summary
 
 
-def check(summary: Summary, require: list[str], minimum: int) -> list[str]:
+def check(
+    summary: Summary, require: list[str], minimum: int, require_tests: list[str] | None = None
+) -> list[str]:
     problems = []
     if summary.results == 0:
         problems.append("no `test result:` line in the cargo output")
@@ -111,6 +128,11 @@ def check(summary: Summary, require: list[str], minimum: int) -> list[str]:
         got = summary.crates.get(crate, Counts()).passed
         if got < minimum:
             problems.append(f"{crate}: {got} passing test(s), at least {minimum} required")
+    for name in require_tests or []:
+        seen = summary.tests.get(name, [])
+        if "ok" not in seen:
+            what = ", ".join(seen) if seen else "no result line"
+            problems.append(f"test {name} did not pass: {what}")
     return problems
 
 
@@ -138,6 +160,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("log", help="file holding the cargo test output, or - for stdin")
     ap.add_argument("--require", action="append", default=[], metavar="CRATE")
     ap.add_argument("--min", type=int, default=1, dest="minimum")
+    ap.add_argument(
+        "--require-test", action="append", default=[], metavar="PATH", dest="require_tests"
+    )
     args = ap.parse_args(argv)
 
     if args.log == "-":
@@ -147,7 +172,7 @@ def main(argv: list[str] | None = None) -> int:
             text = fh.read()
 
     summary = parse(text)
-    problems = check(summary, args.require, args.minimum)
+    problems = check(summary, args.require, args.minimum, args.require_tests)
     report = markdown(summary, problems)
     print(report)
     out = os.environ.get("GITHUB_STEP_SUMMARY")
