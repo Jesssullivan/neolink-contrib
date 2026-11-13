@@ -441,6 +441,8 @@ PUSHER_END_TESTS = [
     for name in (
         "pusher_error_logs_camera_stream_and_cause_at_warn",
         "pusher_panic_logs_camera_stream_and_cause_at_warn",
+        "pusher_literal_panic_logs_its_message_at_warn",
+        "pusher_starts_for_a_camera_name_with_a_nul",
         "pusher_clean_stop_logs_no_warn",
     )
 ]

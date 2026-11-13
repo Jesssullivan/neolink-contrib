@@ -2459,6 +2459,41 @@ mod pusher_end_tests {
         );
     }
 
+    /// A panic on a string literal, as `panic!` with no arguments or
+    /// `Option::unwrap` on `None` gives, carries a `&'static str` and not a
+    /// `String`.
+    #[test]
+    fn pusher_literal_panic_logs_its_message_at_warn() {
+        capture_logs();
+        let (thread_name, cleaned) =
+            run_pusher("yard-literal", || panic!("appsrc has no source pad"));
+        assert_eq!(
+            thread_name.as_deref(),
+            Some("pusher yard-literal::subStream")
+        );
+        assert!(cleaned, "the pusher's cleanup did not run");
+        let lines = lines_naming("yard-literal");
+        assert_eq!(
+            lines,
+            vec![(
+                log::Level::Warn,
+                "Frame pusher for camera yard-literal stream subStream ended on a panic: \
+                 appsrc has no source pad"
+                    .to_string()
+            )]
+        );
+    }
+
+    /// A thread name may not hold a NUL, and TOML lets a camera name hold
+    /// one. The pusher must still start, under the name without the NUL.
+    #[test]
+    fn pusher_starts_for_a_camera_name_with_a_nul() {
+        capture_logs();
+        let (thread_name, cleaned) = run_pusher("yard\0nul", || Ok(()));
+        assert_eq!(thread_name.as_deref(), Some("pusher yardnul::subStream"));
+        assert!(cleaned, "the pusher's cleanup did not run");
+    }
+
     #[test]
     fn pusher_clean_stop_logs_no_warn() {
         capture_logs();

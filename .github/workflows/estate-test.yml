@@ -116,6 +116,8 @@ jobs:
           python3 .github/estate-test/cargo_test_summary.py cargo-test.log
           --require-test rtsp::factory::pusher_end_tests::pusher_error_logs_camera_stream_and_cause_at_warn
           --require-test rtsp::factory::pusher_end_tests::pusher_panic_logs_camera_stream_and_cause_at_warn
+          --require-test rtsp::factory::pusher_end_tests::pusher_literal_panic_logs_its_message_at_warn
+          --require-test rtsp::factory::pusher_end_tests::pusher_starts_for_a_camera_name_with_a_nul
           --require-test rtsp::factory::pusher_end_tests::pusher_clean_stop_logs_no_warn
 
   actionlint:
