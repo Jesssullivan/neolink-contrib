@@ -440,7 +440,10 @@ pub(super) async fn make_factory(
                         // This is not an async thread
                         // The handle lets the thread wait on the async channel
                         // with a timeout; a plain std thread is never inside an
-                        // async context, so block_on is safe here.
+                        // async context, so block_on is safe here. For the
+                        // same reason every tokio timer this thread uses must
+                        // be made inside block_on. Made outside, it panics
+                        // with "there is no reactor running".
                         let runtime = tokio::runtime::Handle::current();
                         std::thread::spawn(move || {
                             let _exit = PusherExit {
@@ -500,10 +503,13 @@ pub(super) async fn make_factory(
                                             // Bounded, so a client that leaves
                                             // while the camera is offline is
                                             // still noticed on the next pass.
-                                            match runtime.block_on(tokio::time::timeout(
-                                                RESUBSCRIBE_TIMEOUT,
-                                                camera.stream_while_live(stream),
-                                            )) {
+                                            match runtime.block_on(async {
+                                                tokio::time::timeout(
+                                                    RESUBSCRIBE_TIMEOUT,
+                                                    camera.stream_while_live(stream),
+                                                )
+                                                .await
+                                            }) {
                                                 Ok(Ok(new_rx)) => {
                                                     log::debug!(
                                                         "{name}::{stream}: Camera stream resubscribed"
