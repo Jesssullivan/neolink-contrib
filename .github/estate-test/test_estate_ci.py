@@ -226,6 +226,70 @@ class SummaryChecks(unittest.TestCase):
             self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
 
 
+class RequiredTests(unittest.TestCase):
+    """Guard G12: a test named with --require-test must have an ok line."""
+
+    NAME = "rtsp::tests::one"
+
+    def problems(self, text: str, names: list[str]) -> list[str]:
+        return cts.check(cts.parse(text), [], 1, names)
+
+    def test_ok_line_passes(self):
+        self.assertEqual(self.problems(CARGO_OK, [self.NAME, "rtsp::tests::two"]), [])
+
+    def test_missing_test_fails_and_names_it(self):
+        problems = self.problems(CARGO_OK, ["rtsp::tests::three"])
+        self.assertEqual(problems, ["test rtsp::tests::three did not pass: no result line"])
+
+    def test_name_must_match_exactly(self):
+        self.assertTrue(self.problems(CARGO_OK, ["rtsp::tests::on"]))
+        self.assertTrue(self.problems(CARGO_OK, ["tests::one"]))
+        self.assertTrue(self.problems(CARGO_OK, ["rtsp::tests::one_more"]))
+
+    def test_failed_test_fails(self):
+        text = CARGO_OK.replace(f"test {self.NAME} ... ok", f"test {self.NAME} ... FAILED")
+        problems = self.problems(text, [self.NAME])
+        self.assertIn(f"test {self.NAME} did not pass: FAILED", problems)
+
+    def test_ignored_test_fails(self):
+        for outcome in ("ignored", "ignored, needs a camera"):
+            with self.subTest(outcome=outcome):
+                text = CARGO_OK.replace(f"test {self.NAME} ... ok", f"test {self.NAME} ... {outcome}")
+                self.assertIn(f"test {self.NAME} did not pass: ignored", self.problems(text, [self.NAME]))
+
+    def test_grammar_doc_test_names_ansi_and_crlf(self):
+        text = CARGO_OK.replace("\n", "\r\n").replace(
+            f"test {self.NAME} ... ok", f"\x1b[32mtest {self.NAME} ... ok\x1b[0m"
+        )
+        summary = cts.parse(text)
+        self.assertEqual(summary.tests[self.NAME], ["ok"])
+        self.assertEqual(summary.tests["crates/core/src/lib.rs - (line 10)"], ["ok"])
+        self.assertEqual(summary.tests["bc::de::tests::c"], ["ignored"])
+        # The run summary is not a test.
+        self.assertFalse(any(n.startswith("result") for n in summary.tests))
+
+    def test_main_exit_code(self):
+        with tempfile.TemporaryDirectory() as d:
+            log = Path(d) / "ok.log"
+            log.write_text(CARGO_OK)
+            script = str(HERE / "cargo_test_summary.py")
+            env = {k: v for k, v in os.environ.items() if k != "GITHUB_STEP_SUMMARY"}
+            for name, want in ((self.NAME, 0), ("rtsp::tests::three", 1)):
+                with self.subTest(name=name):
+                    r = subprocess.run(
+                        [sys.executable, script, str(log), "--require-test", name],
+                        env=env, capture_output=True, text=True,
+                    )
+                    self.assertEqual(r.returncode, want, r.stdout + r.stderr)
+
+    def test_workflow_names_every_resubscribe_test(self):
+        """The step names the five tests in src/rtsp/factory.rs, and each exists there."""
+        source = (ROOT / "src/rtsp/factory.rs").read_text()
+        self.assertIn("mod resubscribe_tests {", source)
+        for t in RESUBSCRIBE_TESTS:
+            self.assertIn(f"fn {t.rsplit('::', 1)[1]}()", source)
+
+
 class GstElementCheck(unittest.TestCase):
     """Guard G5: the element check fails when a named element is missing."""
 
@@ -339,6 +403,18 @@ class NoTestUtilCheck(unittest.TestCase):
         self.assertNotIn("test-util", features.get("default", []))
 
 
+# The tests that drive the RTSP frame pusher's resubscribe from a plain thread.
+RESUBSCRIBE_TESTS = [
+    "rtsp::factory::resubscribe_tests::" + name
+    for name in (
+        "resubscribe_on_a_plain_thread_returns_the_new_stream",
+        "resubscribe_on_a_plain_thread_times_out_a_hung_attempt",
+        "resubscribe_stops_once_the_client_has_gone",
+        "resubscribe_to_a_gone_camera_retries_until_the_client_leaves",
+        "resubscribe_backoff_stops_at_its_max",
+    )
+]
+
 # Every step whose exit status decides whether estate-test passes, with the exact
 # keys it may carry. A run is compared after collapsing whitespace, so only
 # layout may change. An exact match, not a deny list, is what stops a later
@@ -363,6 +439,11 @@ GATING_STEPS = {
         "if": "${{ !cancelled() }}",
         "run": "python3 .github/estate-test/cargo_test_summary.py cargo-test.log "
                "--require neolink_core --min 1",
+    },
+    ("estate-test", "rtsp_resubscribe_tests_ran"): {
+        "if": "${{ !cancelled() }}",
+        "run": "python3 .github/estate-test/cargo_test_summary.py cargo-test.log "
+               + " ".join(f"--require-test {t}" for t in RESUBSCRIBE_TESTS),
     },
     ("actionlint", "actionlint estate-test.yml"): {
         "run": "./actionlint -color .github/workflows/estate-test.yml",
@@ -455,6 +536,7 @@ class EstateTestWorkflow(unittest.TestCase):
             "release_build_has_no_test_util",
             "cargo test",
             "estate_test_job_runs_core_tests",
+            "rtsp_resubscribe_tests_ran",
         )]
         self.assertEqual(order, sorted(order))
 

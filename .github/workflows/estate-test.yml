@@ -86,6 +86,19 @@ jobs:
         if: ${{ !cancelled() }}
         run: python3 .github/estate-test/cargo_test_summary.py cargo-test.log --require neolink_core --min 1
 
+      # The RTSP frame pusher resubscribes to a dropped camera from a plain
+      # thread. These tests drive that path from such a thread. Each is named,
+      # so a change that renames, gates or ignores one fails the job.
+      - name: rtsp_resubscribe_tests_ran
+        if: ${{ !cancelled() }}
+        run: >-
+          python3 .github/estate-test/cargo_test_summary.py cargo-test.log
+          --require-test rtsp::factory::resubscribe_tests::resubscribe_on_a_plain_thread_returns_the_new_stream
+          --require-test rtsp::factory::resubscribe_tests::resubscribe_on_a_plain_thread_times_out_a_hung_attempt
+          --require-test rtsp::factory::resubscribe_tests::resubscribe_stops_once_the_client_has_gone
+          --require-test rtsp::factory::resubscribe_tests::resubscribe_to_a_gone_camera_retries_until_the_client_leaves
+          --require-test rtsp::factory::resubscribe_tests::resubscribe_backoff_stops_at_its_max
+
   actionlint:
     name: actionlint
     runs-on: ubuntu-24.04
