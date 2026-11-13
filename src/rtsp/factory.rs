@@ -284,6 +284,47 @@ fn sources_alive(vid: &Option<AppSrc>, aud: &Option<AppSrc>) -> bool {
     vid.as_ref().is_some_and(source_alive) || aud.as_ref().is_some_and(source_alive)
 }
 
+/// Subscribes to the camera again after its stream ended while a client is
+/// still watching. The frame pusher calls this from its plain std thread,
+/// which has no runtime context, so `subscribe` and its timeout are both made
+/// inside `runtime.block_on`. Before each attempt it sleeps `backoff`, which
+/// doubles up to `RESUBSCRIBE_BACKOFF_MAX`, and gives up on an attempt after
+/// `limit`. Returns the new stream, or `None` once `watching` says the client
+/// has gone.
+fn resubscribe<T, Fut>(
+    runtime: &tokio::runtime::Handle,
+    backoff: &mut Duration,
+    limit: Duration,
+    mut watching: impl FnMut() -> bool,
+    mut subscribe: impl FnMut() -> Fut,
+    label: &str,
+) -> Option<T>
+where
+    Fut: std::future::Future<Output = AnyResult<T>>,
+{
+    loop {
+        std::thread::sleep(*backoff);
+        *backoff = (*backoff * 2).min(RESUBSCRIBE_BACKOFF_MAX);
+        if !watching() {
+            return None;
+        }
+        // Bounded, so a client that leaves while the camera is offline is
+        // still noticed on the next pass.
+        match runtime.block_on(async { tokio::time::timeout(limit, subscribe()).await }) {
+            Ok(Ok(new_rx)) => {
+                log::debug!("{label}: Camera stream resubscribed");
+                return Some(new_rx);
+            }
+            Ok(Err(e)) => {
+                log::debug!("{label}: Camera stream resubscribe failed: {e:?}");
+            }
+            Err(_) => {
+                log::debug!("{label}: Camera stream resubscribe timed out");
+            }
+        }
+    }
+}
+
 /// Runs when a frame pusher exits, however it exits. Nothing will feed this
 /// media again, so end its streams and retire its cache key; otherwise the
 /// shared media stays cached and every later client joins a pipeline that
@@ -494,42 +535,21 @@ pub(super) async fn make_factory(
                                         // is still watching. Subscribe again
                                         // rather than leave it on a media
                                         // that will never get another frame.
-                                        loop {
-                                            std::thread::sleep(backoff);
-                                            backoff = (backoff * 2).min(RESUBSCRIBE_BACKOFF_MAX);
-                                            if !sources_alive(&vid_src, &aud_src) {
-                                                break 'frames;
+                                        match resubscribe(
+                                            &runtime,
+                                            &mut backoff,
+                                            RESUBSCRIBE_TIMEOUT,
+                                            || sources_alive(&vid_src, &aud_src),
+                                            || camera.stream_while_live(stream),
+                                            &format!("{name}::{stream}"),
+                                        ) {
+                                            Some(new_rx) => {
+                                                media_rx = new_rx;
+                                                need_keyframe = true;
+                                                clock.camera_restarted();
+                                                continue 'frames;
                                             }
-                                            // Bounded, so a client that leaves
-                                            // while the camera is offline is
-                                            // still noticed on the next pass.
-                                            match runtime.block_on(async {
-                                                tokio::time::timeout(
-                                                    RESUBSCRIBE_TIMEOUT,
-                                                    camera.stream_while_live(stream),
-                                                )
-                                                .await
-                                            }) {
-                                                Ok(Ok(new_rx)) => {
-                                                    log::debug!(
-                                                        "{name}::{stream}: Camera stream resubscribed"
-                                                    );
-                                                    media_rx = new_rx;
-                                                    need_keyframe = true;
-                                                    clock.camera_restarted();
-                                                    continue 'frames;
-                                                }
-                                                Ok(Err(e)) => {
-                                                    log::debug!(
-                                                        "{name}::{stream}: Camera stream resubscribe failed: {e:?}"
-                                                    );
-                                                }
-                                                Err(_) => {
-                                                    log::debug!(
-                                                        "{name}::{stream}: Camera stream resubscribe timed out"
-                                                    );
-                                                }
-                                            }
+                                            None => break 'frames,
                                         }
                                     }
                                     Err(_) => {
@@ -1743,6 +1763,156 @@ mod watch_tests {
         let just_before = t0 + PIPELINE_LIVE_DEADLINE - Duration::from_millis(1);
         assert!(watch.keep_going(false, just_before));
         assert!(!watch.keep_going(false, t0 + PIPELINE_LIVE_DEADLINE));
+    }
+}
+
+/// The frame pusher resubscribes from a plain std thread, which has no tokio
+/// runtime context. These tests call `resubscribe` from such a thread, with
+/// no camera and no network, the way the pusher does after a camera drop.
+#[cfg(test)]
+mod resubscribe_tests {
+    use super::resubscribe;
+    use crate::common::{NeoCamCommand, NeoInstance};
+    use anyhow::anyhow;
+    use neolink_core::bc_protocol::{BcCamera, StreamKind};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Weak,
+    };
+    use std::time::{Duration, Instant};
+    use tokio_util::sync::CancellationToken;
+
+    const NO_BACKOFF: Duration = Duration::from_millis(1);
+
+    /// Runs `f` on a new std thread, as the pusher runs, and returns its
+    /// result or the message it panicked with.
+    fn on_plain_thread<T: Send + 'static>(
+        f: impl FnOnce() -> T + Send + 'static,
+    ) -> Result<T, String> {
+        std::thread::spawn(f).join().map_err(|panic| {
+            panic
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| panic.downcast_ref::<&str>().map(|s| s.to_string()))
+                .unwrap_or_else(|| "a panic with no message".to_string())
+        })
+    }
+
+    #[test]
+    fn resubscribe_on_a_plain_thread_returns_the_new_stream() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let runtime = rt.handle().clone();
+        let got = on_plain_thread(move || {
+            let attempts = AtomicUsize::new(0);
+            let mut backoff = NO_BACKOFF;
+            resubscribe(
+                &runtime,
+                &mut backoff,
+                Duration::from_secs(5),
+                || true,
+                || {
+                    let n = attempts.fetch_add(1, Ordering::SeqCst);
+                    async move {
+                        // A real resubscribe spawns its stream tasks, which
+                        // needs the runtime context too.
+                        tokio::spawn(async {}).await?;
+                        if n == 0 {
+                            Err(anyhow!("camera still asleep"))
+                        } else {
+                            crate::AnyResult::Ok(n)
+                        }
+                    }
+                },
+                "test::mainStream",
+            )
+        });
+        assert_eq!(got, Ok(Some(1)), "the second attempt's stream comes back");
+    }
+
+    #[test]
+    fn resubscribe_on_a_plain_thread_times_out_a_hung_attempt() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let runtime = rt.handle().clone();
+        let limit = Duration::from_millis(100);
+        let got = on_plain_thread(move || {
+            let attempts = AtomicUsize::new(0);
+            let mut backoff = NO_BACKOFF;
+            let started = Instant::now();
+            let got = resubscribe(
+                &runtime,
+                &mut backoff,
+                limit,
+                || true,
+                || {
+                    let n = attempts.fetch_add(1, Ordering::SeqCst);
+                    async move {
+                        if n == 0 {
+                            std::future::pending::<()>().await;
+                        }
+                        crate::AnyResult::Ok(n)
+                    }
+                },
+                "test::mainStream",
+            );
+            (got, started.elapsed())
+        });
+        let (got, took) = got.expect("resubscribe ran without a panic");
+        assert_eq!(got, Some(1), "the hung attempt gave way to the next one");
+        assert!(took >= limit, "the hung attempt was held for its limit");
+        assert!(took < Duration::from_secs(5), "took {:?}", took);
+    }
+
+    #[test]
+    fn resubscribe_stops_once_the_client_has_gone() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let runtime = rt.handle().clone();
+        let got = on_plain_thread(move || {
+            let attempts = AtomicUsize::new(0);
+            let mut backoff = NO_BACKOFF;
+            let got: Option<()> = resubscribe(
+                &runtime,
+                &mut backoff,
+                Duration::from_secs(5),
+                || false,
+                || {
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                    async { crate::AnyResult::Ok(()) }
+                },
+                "test::mainStream",
+            );
+            (got, attempts.load(Ordering::SeqCst))
+        });
+        assert_eq!(got, Ok((None, 0)), "no attempt once nobody watches");
+    }
+
+    /// The same call the pusher makes, `NeoInstance::stream_while_live`, on
+    /// an instance whose camera is gone, so every attempt fails at once.
+    #[test]
+    fn resubscribe_to_a_gone_camera_retries_until_the_client_leaves() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let runtime = rt.handle().clone();
+        let (_camera_tx, camera_watch) = tokio::sync::watch::channel(Weak::<BcCamera>::new());
+        let (control_tx, control_rx) = tokio::sync::mpsc::channel::<NeoCamCommand>(1);
+        drop(control_rx);
+        let camera = NeoInstance::new(camera_watch, control_tx, CancellationToken::new()).unwrap();
+        let got = on_plain_thread(move || {
+            let checks = AtomicUsize::new(0);
+            let mut backoff = NO_BACKOFF;
+            let got = resubscribe(
+                &runtime,
+                &mut backoff,
+                Duration::from_secs(5),
+                || checks.fetch_add(1, Ordering::SeqCst) < 3,
+                || camera.stream_while_live(StreamKind::Main),
+                "test::mainStream",
+            );
+            (got.is_some(), checks.load(Ordering::SeqCst))
+        });
+        assert_eq!(
+            got,
+            Ok((false, 4)),
+            "three failed attempts, then the client was gone"
+        );
     }
 }
 
