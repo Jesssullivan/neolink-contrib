@@ -10,6 +10,9 @@ license = "AGPL-3.0-or-later"
 members = [
   "crates/*",
 ]
+# Resolver 2 keeps dev-dependency features, such as neolink_core/test-util,
+# out of a normal or release build. The 2018 edition default is resolver 1.
+resolver = "2"
 
 [dependencies]
 anyhow = "1.0.70"
@@ -45,6 +48,9 @@ validator = {version="0.18.1", features = ["derive"] }
 
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 tikv-jemallocator = "0.5"
+
+[dev-dependencies]
+neolink_core = { path = "crates/core", features = ["test-util"] }
 
 [features]
 default = ["gstreamer"]

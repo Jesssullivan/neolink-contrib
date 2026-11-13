@@ -202,9 +202,16 @@ async fn update_camera_time(camera: &BcCamera, name: &str, update_time: bool) ->
         if update_time {
             update = true;
         }
-    } else {
+    } else if update_time {
         update = true;
         log::warn!("{}: Camera has no time set, Updating", name);
+    } else {
+        // update_time = false means no write to the camera, even when its
+        // clock is unset.
+        log::warn!(
+            "{}: Camera has no time set. Leaving it, because update_time is false",
+            name
+        );
     }
     if update {
         use std::time::SystemTime;
@@ -228,4 +235,114 @@ async fn update_camera_time(camera: &BcCamera, name: &str, update_time: bool) ->
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    //! The camera is an in-memory fake with no network. Its clock replies are
+    //! SYNTHETIC, written by hand to the fields of `SystemGeneral`.
+    use super::*;
+    use neolink_core::bc::{model::*, xml::*};
+    use neolink_core::bc_protocol::test_util::FakeCamera;
+
+    /// A camera whose clock reads 1 January of `year`, 00:00 UTC. It answers
+    /// message 104 with that clock and message 105 with 200. neolink reads a
+    /// year before 2019 as "no time set".
+    async fn camera_with_clock_in(year: i32) -> FakeCamera {
+        FakeCamera::new(&["general"], move |request| {
+            let meta = BcMeta {
+                msg_id: request.meta.msg_id,
+                channel_id: request.meta.channel_id,
+                msg_num: request.meta.msg_num,
+                response_code: 200,
+                stream_type: 0,
+                class: 0x0000,
+            };
+            match request.meta.msg_id {
+                MSG_ID_GET_GENERAL => vec![Bc::new_from_xml(
+                    meta,
+                    BcXml {
+                        system_general: Some(SystemGeneral {
+                            version: "1.1".to_string(),
+                            time_zone: Some(0),
+                            year: Some(year),
+                            month: Some(1),
+                            day: Some(1),
+                            hour: Some(0),
+                            minute: Some(0),
+                            second: Some(0),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                )],
+                MSG_ID_SET_GENERAL => vec![Bc {
+                    meta,
+                    body: BcBody::ModernMsg(ModernMsg::default()),
+                }],
+                _ => vec![],
+            }
+        })
+        .await
+        .expect("fake camera")
+    }
+
+    /// TIN-8227: with `update_time = false`, a camera that reports no time
+    /// gets message 104 only. Message 105 would write its clock.
+    #[tokio::test]
+    async fn update_time_false_never_writes_a_camera_with_no_time() {
+        let fake = camera_with_clock_in(1999).await;
+
+        update_camera_time(&fake.camera, "fake", false)
+            .await
+            .expect("time check");
+
+        assert_eq!(fake.received_ids(), vec![MSG_ID_GET_GENERAL]);
+    }
+
+    /// With `update_time = false`, a camera with its time set gets message
+    /// 104 only.
+    #[tokio::test]
+    async fn update_time_false_never_writes_a_camera_with_a_time() {
+        let fake = camera_with_clock_in(2026).await;
+
+        update_camera_time(&fake.camera, "fake", false)
+            .await
+            .expect("time check");
+
+        assert_eq!(fake.received_ids(), vec![MSG_ID_GET_GENERAL]);
+    }
+
+    /// Control for the two tests above: the fake does see a clock write when
+    /// one is asked for, so an empty write list is not an artefact of the
+    /// fake.
+    #[tokio::test]
+    async fn update_time_true_writes_a_camera_with_no_time() {
+        let fake = camera_with_clock_in(1999).await;
+
+        update_camera_time(&fake.camera, "fake", true)
+            .await
+            .expect("time check");
+
+        assert_eq!(
+            fake.received_ids(),
+            vec![MSG_ID_GET_GENERAL, MSG_ID_SET_GENERAL, MSG_ID_GET_GENERAL]
+        );
+    }
+
+    /// The `true` path is unchanged: a camera with its time set still gets
+    /// its clock synced with message 105.
+    #[tokio::test]
+    async fn update_time_true_writes_a_camera_with_a_time() {
+        let fake = camera_with_clock_in(2026).await;
+
+        update_camera_time(&fake.camera, "fake", true)
+            .await
+            .expect("time check");
+
+        assert_eq!(
+            fake.received_ids(),
+            vec![MSG_ID_GET_GENERAL, MSG_ID_SET_GENERAL, MSG_ID_GET_GENERAL]
+        );
+    }
 }

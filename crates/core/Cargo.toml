@@ -30,6 +30,10 @@ tokio = { version = "1.27.0", features = ["full"] }
 tokio-stream = { version = "0.1.12", features = ["sync", "time", "net"] }
 tokio-util = { version = "0.7.7", features = ["full", "tracing"] }
 
+[features]
+# Test support for crates that use this one: an in-memory fake camera.
+test-util = []
+
 [dev-dependencies]
 assert_matches = "1.5.0"
 env_logger = "*"

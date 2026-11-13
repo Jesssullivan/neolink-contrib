@@ -39,6 +39,8 @@ mod stream;
 mod stream_info;
 mod support;
 mod talk;
+#[cfg(feature = "test-util")]
+pub mod test_util;
 mod time;
 mod uid;
 mod users;

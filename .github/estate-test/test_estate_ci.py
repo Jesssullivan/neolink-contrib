@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import stat
 import subprocess
 import sys
@@ -265,6 +266,79 @@ class GstElementCheck(unittest.TestCase):
         self.assertEqual(self.run_check([], []).returncode, 2)
 
 
+TREE_ARGS = (
+    "tree --locked --all-features --target all -e normal,build "
+    "-i neolink_core --depth 0 --format {p} [{f}]"
+)
+
+
+class NoTestUtilCheck(unittest.TestCase):
+    """Guard G12: a normal build never compiles neolink_core with test-util."""
+
+    def run_check(self, output: str) -> subprocess.CompletedProcess:
+        with tempfile.TemporaryDirectory() as d:
+            fake = Path(d) / "fake-cargo"
+            args = Path(d) / "args"
+            fake.write_text(
+                "#!/usr/bin/env bash\n"
+                f'printf "%s\\n" "$*" > {shlex.quote(str(args))}\n'
+                f"printf '%s\\n' {shlex.quote(output.rstrip())}\n"
+            )
+            fake.chmod(fake.stat().st_mode | stat.S_IXUSR)
+            env = dict(os.environ, ESTATE_CARGO=str(fake))
+            r = subprocess.run(
+                ["bash", str(HERE / "check_no_test_util.sh")],
+                env=env, capture_output=True, text=True,
+            )
+            r.args_seen = args.read_text().strip() if args.exists() else ""
+            return r
+
+    def test_no_feature_passes(self):
+        r = self.run_check("neolink_core v0.6.3-rc.3 (/build/crates/core) []\n")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.args_seen, TREE_ARGS)
+
+    def test_other_features_pass(self):
+        r = self.run_check("neolink_core v0.6.3-rc.3 (/build/crates/core) [default,test-utils]\n")
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_test_util_fails(self):
+        # The line cargo tree printed for this workspace under resolver 1.
+        r = self.run_check("neolink_core v0.6.3-rc.3 (/build/crates/core) [test-util]\n")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("neolink_core/test-util", r.stderr)
+
+    def test_test_util_among_others_fails(self):
+        r = self.run_check("neolink_core v0.6.3-rc.3 (/build/crates/core) [default,test-util]\n")
+        self.assertEqual(r.returncode, 1)
+
+    def test_output_without_feature_list_fails(self):
+        self.assertEqual(self.run_check("warning: nothing to print\n").returncode, 2)
+
+    def test_root_uses_resolver_2(self):
+        with open(ROOT / "Cargo.toml", "rb") as fh:
+            manifest = tomllib.load(fh)
+        self.assertEqual(manifest["workspace"].get("resolver"), "2")
+        self.assertEqual(
+            manifest["dev-dependencies"]["neolink_core"].get("features"), ["test-util"]
+        )
+        self.assertNotIn("test-util", manifest["dependencies"]["neolink_core"].get("features", []))
+
+    def test_test_util_module_is_gated(self):
+        """The fake camera module compiles only with the test-util feature."""
+        lines = [
+            line.strip()
+            for line in (ROOT / "crates/core/src/bc_protocol.rs").read_text().splitlines()
+        ]
+        self.assertEqual(lines.count("pub mod test_util;"), 1)
+        i = lines.index("pub mod test_util;")
+        self.assertEqual(lines[i - 1], '#[cfg(feature = "test-util")]')
+        with open(ROOT / "crates/core/Cargo.toml", "rb") as fh:
+            features = tomllib.load(fh)["features"]
+        self.assertEqual(features["test-util"], [])
+        self.assertNotIn("test-util", features.get("default", []))
+
+
 # Every step whose exit status decides whether estate-test passes, with the exact
 # keys it may carry. A run is compared after collapsing whitespace, so only
 # layout may change. An exact match, not a deny list, is what stops a later
@@ -275,6 +349,9 @@ GATING_STEPS = {
     },
     ("estate-test", "GStreamer elements"): {
         "run": "bash .github/estate-test/check_gst_elements.sh voaacenc avenc_aac faad aacparse rtpmp4gpay",
+    },
+    ("estate-test", "release_build_has_no_test_util"): {
+        "run": "bash .github/estate-test/check_no_test_util.sh",
     },
     ("estate-test", "cargo test"): {
         # An explicit bash shell runs with -o pipefail, so tee cannot hide a cargo failure.
@@ -374,6 +451,8 @@ class EstateTestWorkflow(unittest.TestCase):
         order = [step_index(self.job, n) for n in (
             "Estate CI self-test",
             "GStreamer elements",
+            "Install Rust ${{ env.rust_version }}",
+            "release_build_has_no_test_util",
             "cargo test",
             "estate_test_job_runs_core_tests",
         )]

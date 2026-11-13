@@ -72,6 +72,11 @@ jobs:
           restore-keys: |
             estate-test-${{ runner.os }}-${{ env.rust_version }}-
 
+      # FakeCamera sits behind neolink_core's test-util feature, which no
+      # shipped binary may carry.
+      - name: release_build_has_no_test_util
+        run: bash .github/estate-test/check_no_test_util.sh
+
       - name: cargo test
         shell: bash
         run: |
