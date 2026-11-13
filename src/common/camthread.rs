@@ -329,4 +329,20 @@ mod tests {
             vec![MSG_ID_GET_GENERAL, MSG_ID_SET_GENERAL, MSG_ID_GET_GENERAL]
         );
     }
+
+    /// The `true` path is unchanged: a camera with its time set still gets
+    /// its clock synced with message 105.
+    #[tokio::test]
+    async fn update_time_true_writes_a_camera_with_a_time() {
+        let fake = camera_with_clock_in(2026).await;
+
+        update_camera_time(&fake.camera, "fake", true)
+            .await
+            .expect("time check");
+
+        assert_eq!(
+            fake.received_ids(),
+            vec![MSG_ID_GET_GENERAL, MSG_ID_SET_GENERAL, MSG_ID_GET_GENERAL]
+        );
+    }
 }
