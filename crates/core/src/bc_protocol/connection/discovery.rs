@@ -1612,8 +1612,26 @@ mod tests {
     /// there are as many as there are tids, so a tid drawn without regard to
     /// the open ones repeats with near certainty. A repeat is refused by
     /// `subscribe`, and that destination never gets its request.
+    ///
+    /// Once every request is open, each camera answers as a real one does,
+    /// with a D2C_C_R that echoes the tid and the cid of the request, and
+    /// again for each resend. Every request must then succeed. A reply that
+    /// carries tid 0 is not routed to its request, so a request that drew
+    /// tid 0 would time out here.
     #[tokio::test]
     async fn every_open_destination_gets_its_own_tid() -> Result<()> {
+        fn answer(tid: u32, cid: i32, did: i32) -> BcUdp {
+            BcUdp::Discovery(UdpDiscovery {
+                tid,
+                payload: UdpXml::D2cCr(D2cCr {
+                    timer: Default::default(),
+                    rsp: 0,
+                    cid,
+                    did,
+                }),
+            })
+        }
+
         let discoverer = Discoverer::new().await?;
         let mut cameras = vec![];
         for _ in TID_RANGE {
@@ -1625,15 +1643,17 @@ mod tests {
             .map(|camera| camera.get_ref().local_addr())
             .collect::<std::io::Result<Vec<_>>>()?;
 
-        let mut requests = dests
+        let requests = dests
             .iter()
             .map(|&dest| discoverer.client_initiated_direct(UID, 7, dest))
-            .collect::<FuturesUnordered<_>>();
+            .collect::<FuturesUnordered<_>>()
+            .collect::<Vec<_>>();
 
-        let received = async {
+        let cameras_answer = async {
             let mut tids = BTreeMap::new();
+            let mut asked = vec![];
             for (n, camera) in cameras.iter_mut().enumerate() {
-                let (msg, _) = timeout(Duration::from_secs(5), camera.next())
+                let (msg, from) = timeout(Duration::from_secs(5), camera.next())
                     .await
                     .unwrap_or_else(|_| {
                         panic!("destination {} of {} got no request", n, dests.len())
@@ -1643,32 +1663,58 @@ mod tests {
                 match msg {
                     BcUdp::Discovery(UdpDiscovery {
                         tid,
-                        payload: UdpXml::C2dC(C2dC { uid, .. }),
+                        payload: UdpXml::C2dC(C2dC { uid, cid, .. }),
                     }) => {
                         assert_eq!(uid, UID);
-                        assert!(
-                            TID_RANGE.contains(&tid),
-                            "tid {} outside {:?}",
-                            tid,
-                            TID_RANGE
-                        );
+                        assert!((1..=255).contains(&tid), "tid {} outside 1..=255", tid);
                         if let Some(earlier) = tids.insert(tid, n) {
                             panic!("destinations {} and {} share tid {}", earlier, n, tid);
                         }
+                        asked.push((tid, cid, from));
                     }
                     other => panic!("destination {} got {:?}", n, other),
                 }
             }
-            tids
+            cameras
+                .iter_mut()
+                .zip(asked)
+                .enumerate()
+                .map(|(n, (camera, (tid, cid, from)))| async move {
+                    let did = n as i32;
+                    camera
+                        .send((answer(tid, cid, did), from))
+                        .await
+                        .expect("the reply is sent");
+                    while let Some(Ok((msg, from))) = camera.next().await {
+                        if let BcUdp::Discovery(UdpDiscovery {
+                            tid,
+                            payload: UdpXml::C2dC(C2dC { cid, .. }),
+                        }) = msg
+                        {
+                            camera
+                                .send((answer(tid, cid, did), from))
+                                .await
+                                .expect("the reply is sent");
+                        }
+                    }
+                })
+                .collect::<FuturesUnordered<_>>()
+                .collect::<Vec<_>>()
+                .await;
         };
 
-        let tids = tokio::select! {
-            tids = received => tids,
-            _ = async { while requests.next().await.is_some() {} } => {
-                panic!("every request ended before each destination got one")
+        let results = timeout(Duration::from_secs(30), async {
+            tokio::select! {
+                _ = cameras_answer => panic!("the cameras stopped answering"),
+                results = requests => results,
             }
-        };
-        assert_eq!(tids.len(), dests.len());
+        })
+        .await
+        .expect("every request ends");
+        assert_eq!(results.len(), dests.len());
+        for result in results {
+            assert!(result.is_ok(), "a request failed: {:?}", result.err());
+        }
         Ok(())
     }
 
@@ -1680,12 +1726,14 @@ mod tests {
         let mut held = BTreeMap::new();
         for _ in TID_RANGE {
             let (tid, rx) = discoverer.subscribe_new().await?;
+            assert!((1..=255).contains(&tid), "tid {} outside 1..=255", tid);
             assert!(
                 held.insert(tid, rx).is_none(),
                 "tid {} handed out twice",
                 tid
             );
         }
+        assert_eq!(held.len(), 255);
         assert!(
             discoverer.subscribe_new().await.is_err(),
             "a tid was handed out while all {} were held",
