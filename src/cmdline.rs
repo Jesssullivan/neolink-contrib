@@ -21,6 +21,7 @@ pub enum Command {
     Rtsp(super::rtsp::Opt),
     StatusLight(super::statusled::Opt),
     Reboot(super::reboot::Opt),
+    Siren(super::siren::Opt),
     Pir(super::pir::Opt),
     Ptz(super::ptz::Opt),
     #[cfg(feature = "gstreamer")]

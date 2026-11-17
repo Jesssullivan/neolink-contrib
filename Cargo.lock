@@ -555,15 +555,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "crossbeam-channel"
-version = "0.5.12"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ab3db02a9c5b5121e1e42fbdb1aeb65f5e02624cc58c43f2884c6ccac0b82f95"
-dependencies = [
- "crossbeam-utils",
-]
-
-[[package]]
 name = "crossbeam-utils"
 version = "0.8.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1873,7 +1864,6 @@ dependencies = [
  "byte-slice-cast",
  "bytes",
  "clap",
- "crossbeam-channel",
  "dirs",
  "env_logger 0.11.3",
  "fcm-push-listener",
@@ -1911,7 +1901,6 @@ dependencies = [
  "cfb-mode",
  "cookie-factory",
  "crc32fast",
- "crossbeam-channel",
  "delegate",
  "env_logger 0.11.3",
  "futures",

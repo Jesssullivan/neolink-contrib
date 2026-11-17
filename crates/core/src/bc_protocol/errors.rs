@@ -136,6 +136,12 @@ pub enum Error {
     #[error("Talk data is not ADPCM")]
     UnknownTalkEncoding,
 
+    /// Raised when the camera answers a talk request with 422, which means
+    /// another client is talking, and the caller asked to fail rather than
+    /// take the speaker over
+    #[error("The camera is busy with another talk")]
+    TalkBusy,
+
     /// Raised when dicovery times out waiting for a reply
     #[error("Timed out while waiting for camera reply")]
     DiscoveryTimeout,

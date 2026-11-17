@@ -1,9 +1,29 @@
 use super::{BcCamera, Error, Result};
 use crate::{bc::model::*, bc::xml::*, bcmedia::model::*};
-use crossbeam_channel::Receiver;
-use std::io::{BufRead, Error as IoError, ErrorKind, Read};
+use std::time::{Duration, Instant};
+use tokio::sync::mpsc::Receiver;
+use tokio::time::timeout;
 
-type IoResult<T> = std::result::Result<T, IoError>;
+/// What a talk does when the camera answers its talk request with 422.
+///
+/// The camera answers 422 when another client is talking, or when an earlier
+/// talk ended without sending message 11.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TalkOnBusy {
+    /// Return [`Error::TalkBusy`] and send nothing more.
+    Fail,
+    /// Send message 11 to reset the camera's talk, then send the same talk
+    /// request again. The official client does this.
+    #[default]
+    Preempt,
+}
+
+/// How long `talk_stream` waits for the camera to answer one block of audio.
+const TALK_REPLY_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// How far `talk_stream` may run ahead of the audio the camera has played,
+/// once the camera has stopped answering blocks and so gives no back pressure.
+const TALK_SILENT_LEAD: Duration = Duration::from_millis(500);
 
 impl BcCamera {
     ///
@@ -100,36 +120,9 @@ impl BcCamera {
         }
     }
 
-    ///
-    /// Send sound to the camera
-    ///
-    /// The data should be in the format as described in `<TalkAbility>` xml
-    /// This method assumes that you have set up the data in the desired format
-    /// in the `<TalkAbility>` xml
-    ///
-    /// It also checks that it is ADPCM as the code is written to accept only that
-    ///
-    /// # Parameters
-    ///
-    /// * `adpcm` - Data must be adpcm in DVI-4 format
-    ///
-    /// * `talk_config` - The talk config that describes the adpcm data
-    ///
-    ///
-    pub async fn talk(&self, adpcm: &[u8], talk_config: TalkConfig) -> Result<()> {
-        let connection = self.get_connection();
-
-        let msg_num = self.new_message_num();
-        let mut sub = connection.subscribe(MSG_ID_TALKCONFIG, msg_num).await?;
-
-        if &talk_config.audio_config.audio_type != "adpcm" {
-            return Err(Error::UnknownTalkEncoding);
-        }
-
-        let block_size = talk_config.audio_config.length_per_encoder / 2;
-        let sample_rate = talk_config.audio_config.sample_rate;
-
-        let msg = Bc {
+    /// The message 201 that asks the camera to take talk in `talk_config`.
+    fn talk_config_msg(&self, msg_num: u16, talk_config: &TalkConfig) -> Bc {
+        Bc {
             meta: BcMeta {
                 msg_id: MSG_ID_TALKCONFIG,
                 channel_id: self.channel_id,
@@ -144,42 +137,107 @@ impl BcCamera {
                     ..Default::default()
                 }),
                 payload: Some(BcPayloads::BcXml(BcXml {
-                    talk_config: Some(talk_config),
+                    talk_config: Some(talk_config.clone()),
                     ..Default::default()
                 })),
             }),
-        };
+        }
+    }
 
-        sub.send(msg).await?;
+    /// The message 202 that carries one payload of ADPCM blocks.
+    fn talk_data_msg(&self, msg_num: u16, payload: Vec<u8>) -> Bc {
+        Bc {
+            meta: BcMeta {
+                msg_id: MSG_ID_TALK,
+                channel_id: self.channel_id,
+                msg_num,
+                stream_type: 0,
+                response_code: 0,
+                class: 0x6414,
+            },
+            body: BcBody::ModernMsg(ModernMsg {
+                extension: Some(Extension {
+                    channel_id: Some(self.channel_id),
+                    binary_data: Some(1),
+                    ..Default::default()
+                }),
+                payload: Some(BcPayloads::Binary(payload)),
+            }),
+        }
+    }
+
+    /// Sends the talk request and applies `on_busy` to a 422.
+    ///
+    /// On a 422 with [`TalkOnBusy::Preempt`] it sends message 11 and then the
+    /// same request again. The camera's own reply is never sent back.
+    async fn talk_open(&self, talk_config: &TalkConfig, on_busy: TalkOnBusy) -> Result<()> {
+        if talk_config.audio_config.audio_type != "adpcm" {
+            return Err(Error::UnknownTalkEncoding);
+        }
+
+        let connection = self.get_connection();
+        let msg_num = self.new_message_num();
+        let mut sub = connection.subscribe(MSG_ID_TALKCONFIG, msg_num).await?;
+
+        sub.send(self.talk_config_msg(msg_num, talk_config)).await?;
         let mut msg = sub.recv().await?;
 
         // If another client is already talking OR if we crashed before sending
         // msgid 11 the camera will reply 422
         //
-        // The official client in this case just sends msgid 11 and retries so
-        // we will do that too
-        if let BcMeta {
-            response_code: 422, ..
-        } = msg.meta
-        {
-            self.talk_stop().await?;
-            // Retry
-            sub.send(msg).await?;
-            msg = sub.recv().await?;
+        // The official client in this case just sends msgid 11 and retries
+        if msg.meta.response_code == 422 {
+            match on_busy {
+                TalkOnBusy::Fail => return Err(Error::TalkBusy),
+                TalkOnBusy::Preempt => {
+                    self.talk_stop().await?;
+                    sub.send(self.talk_config_msg(msg_num, talk_config)).await?;
+                    msg = sub.recv().await?;
+                }
+            }
         }
 
-        if let BcMeta {
-            response_code: 200, ..
-        } = msg.meta
-        {
-        } else {
+        if msg.meta.response_code != 200 {
             return Err(Error::UnintelligibleReply {
                 reply: std::sync::Arc::new(Box::new(msg)),
                 why:
                     "The camera did not accept the TalkConfig xml. Audio format is likely incorrect",
             });
         }
+        Ok(())
+    }
 
+    ///
+    /// Send sound to the camera
+    ///
+    /// The data should be in the format as described in `<TalkAbility>` xml
+    /// This method assumes that you have set up the data in the desired format
+    /// in the `<TalkAbility>` xml
+    ///
+    /// It also checks that it is ADPCM as the code is written to accept only that
+    ///
+    /// It paces the data with a tokio timer, so it never blocks the runtime.
+    ///
+    /// # Parameters
+    ///
+    /// * `adpcm` - Data must be adpcm in DVI-4 format
+    ///
+    /// * `talk_config` - The talk config that describes the adpcm data
+    ///
+    /// * `on_busy` - What to do when the camera answers that it is busy
+    ///
+    pub async fn talk(
+        &self,
+        adpcm: &[u8],
+        talk_config: TalkConfig,
+        on_busy: TalkOnBusy,
+    ) -> Result<()> {
+        let block_size = talk_config.audio_config.length_per_encoder / 2;
+        let sample_rate = talk_config.audio_config.sample_rate;
+
+        self.talk_open(&talk_config, on_busy).await?;
+
+        let connection = self.get_connection();
         let full_block_size = block_size + 4; // Block size + predictor state
         let msg_num = self.new_message_num();
         let sub = connection.subscribe(MSG_ID_TALK, msg_num).await?;
@@ -197,26 +255,7 @@ impl BcCamera {
                 payload = bcmedia_adpcm.serialize(payload)?;
             }
 
-            let msg = Bc {
-                meta: BcMeta {
-                    msg_id: MSG_ID_TALK,
-                    channel_id: self.channel_id,
-                    msg_num,
-                    stream_type: 0,
-                    response_code: 0,
-                    class: 0x6414,
-                },
-                body: BcBody::ModernMsg(ModernMsg {
-                    extension: Some(Extension {
-                        channel_id: Some(self.channel_id),
-                        binary_data: Some(1),
-                        ..Default::default()
-                    }),
-                    payload: Some(BcPayloads::Binary(payload)),
-                }),
-            };
-
-            sub.send(msg).await?;
+            sub.send(self.talk_data_msg(msg_num, payload)).await?;
 
             let adpcm_len = payload_bytes.len();
             // There are two samples per byte
@@ -225,13 +264,13 @@ impl BcCamera {
             //
             // There is 1 initial sample stored in the block header so we add that in the end
             //
-            let samples_sent = (adpcm_len - BLOCK_HEADER_SIZE * BLOCK_PER_PAYLOAD)
+            let samples_sent = adpcm_len.saturating_sub(BLOCK_HEADER_SIZE * BLOCK_PER_PAYLOAD)
                 * SAMPLES_PER_BYTE
                 + BLOCK_PER_PAYLOAD;
 
             // Time to play the sample in seconds
             let play_length = samples_sent as f32 / sample_rate as f32;
-            std::thread::sleep(std::time::Duration::from_secs_f32(play_length));
+            tokio::time::sleep(Duration::from_secs_f32(play_length)).await;
         }
 
         self.talk_stop().await?;
@@ -242,7 +281,13 @@ impl BcCamera {
     ///
     /// Send sound to the camera through a channel
     ///
-    /// This is similar to [`talk`] except it uses a channel to receive data
+    /// This is similar to [`talk`] except it uses a channel to receive data.
+    /// It reads the channel with `.recv().await` and ends when every sender
+    /// has gone and the channel is empty.
+    ///
+    /// It waits up to two seconds for the camera to answer each block. After
+    /// the first block with no answer it logs once, stops waiting and paces
+    /// the blocks by their play time instead.
     ///
     /// The data should be in the format as described in `<TalkAbility>` xml
     /// This method assumes that you have set up the data in the desired format
@@ -252,75 +297,24 @@ impl BcCamera {
     ///
     /// # Parameters
     ///
-    /// * `adpcm` - Data must be adpcm in DVI-4 format
+    /// * `rx` - Data must be adpcm in DVI-4 format
     ///
     /// * `talk_config` - The talk config that describes the adpcm data
     ///
+    /// * `on_busy` - What to do when the camera answers that it is busy
     ///
-    pub async fn talk_stream(&self, rx: Receiver<Vec<u8>>, talk_config: TalkConfig) -> Result<()> {
-        let connection = self.get_connection();
-
-        let msg_num = self.new_message_num();
-        let mut sub = connection.subscribe(MSG_ID_TALKCONFIG, msg_num).await?;
-
-        if &talk_config.audio_config.audio_type != "adpcm" {
-            return Err(Error::UnknownTalkEncoding);
-        }
-
+    pub async fn talk_stream(
+        &self,
+        rx: &mut Receiver<Vec<u8>>,
+        talk_config: TalkConfig,
+        on_busy: TalkOnBusy,
+    ) -> Result<()> {
         let block_size = talk_config.audio_config.length_per_encoder / 2;
         let sample_rate = talk_config.audio_config.sample_rate;
 
-        let msg = Bc {
-            meta: BcMeta {
-                msg_id: MSG_ID_TALKCONFIG,
-                channel_id: self.channel_id,
-                msg_num,
-                stream_type: 0,
-                response_code: 0,
-                class: 0x6414,
-            },
-            body: BcBody::ModernMsg(ModernMsg {
-                extension: Some(Extension {
-                    channel_id: Some(self.channel_id),
-                    ..Default::default()
-                }),
-                payload: Some(BcPayloads::BcXml(BcXml {
-                    talk_config: Some(talk_config),
-                    ..Default::default()
-                })),
-            }),
-        };
+        self.talk_open(&talk_config, on_busy).await?;
 
-        sub.send(msg).await?;
-        let mut msg = sub.recv().await?;
-
-        // If another client is already talking OR if we crashed before sending
-        // msgid 11 the camera will reply 422
-        //
-        // The official client in this case just sends msgid 11 and retries so
-        // we will do that too
-        if let BcMeta {
-            response_code: 422, ..
-        } = msg.meta
-        {
-            self.talk_stop().await?;
-            // Retry
-            sub.send(msg).await?;
-            msg = sub.recv().await?;
-        }
-
-        if let BcMeta {
-            response_code: 200, ..
-        } = msg.meta
-        {
-        } else {
-            return Err(Error::UnintelligibleReply {
-                reply: std::sync::Arc::new(Box::new(msg)),
-                why:
-                    "The camera did not accept the TalkConfig xml. Audio format is likely incorrect",
-            });
-        }
-
+        let connection = self.get_connection();
         let full_block_size = block_size + 4; // Block size + predictor state
         let msg_num = self.new_message_num();
         let mut sub = connection.subscribe(MSG_ID_TALK, msg_num).await?;
@@ -329,27 +323,26 @@ impl BcCamera {
         const BLOCK_HEADER_SIZE: usize = 4;
         const SAMPLES_PER_BYTE: usize = 2;
 
-        let mut buffered_recv = BufferedStream::from_rx(rx);
-
         let target_chunks = full_block_size as usize * BLOCK_PER_PAYLOAD;
 
+        let mut pending: Vec<u8> = vec![];
         let mut end_of_stream = false;
-        let mut expected_stream_end = std::time::Instant::now();
+        let mut camera_answers = true;
+        let mut expected_stream_end = Instant::now();
         while !end_of_stream {
-            let mut payload_bytes = vec![];
-            while payload_bytes.len() < target_chunks {
-                let mut buffer = vec![255; target_chunks - payload_bytes.len()];
-                if let Ok(read) = buffered_recv.read(&mut buffer) {
-                    payload_bytes.extend(&buffer[..read]);
-                } else {
-                    // Error should occur if the channel is dropped
-                    // and all bytes are consumed
-                    end_of_stream = true;
-                }
-                if end_of_stream {
-                    break;
+            while pending.len() < target_chunks {
+                match rx.recv().await {
+                    Some(data) => pending.extend(data),
+                    None => {
+                        // Every sender has gone and the channel is empty
+                        end_of_stream = true;
+                        break;
+                    }
                 }
             }
+
+            let take = std::cmp::min(target_chunks, pending.len());
+            let payload_bytes: Vec<u8> = pending.drain(..take).collect();
 
             let mut payload = vec![];
             for block_bytes in payload_bytes.chunks(full_block_size as usize) {
@@ -375,43 +368,52 @@ impl BcCamera {
             };
 
             // Time to play the sample in seconds
-            let play_length = samples_sent as f32 / sample_rate as f32;
+            let play_length = Duration::from_secs_f32(samples_sent as f32 / sample_rate as f32);
 
-            let msg = Bc {
-                meta: BcMeta {
-                    msg_id: MSG_ID_TALK,
-                    channel_id: self.channel_id,
-                    msg_num,
-                    stream_type: 0,
-                    response_code: 0,
-                    class: 0x6414,
-                },
-                body: BcBody::ModernMsg(ModernMsg {
-                    extension: Some(Extension {
-                        channel_id: Some(self.channel_id),
-                        binary_data: Some(1),
-                        ..Default::default()
-                    }),
-                    payload: Some(BcPayloads::Binary(payload)),
-                }),
-            };
+            if !camera_answers {
+                // No answers means no back pressure, so keep at most
+                // TALK_SILENT_LEAD ahead of what the camera has played.
+                let ahead = expected_stream_end.saturating_duration_since(Instant::now());
+                if ahead > TALK_SILENT_LEAD {
+                    tokio::time::sleep(ahead - TALK_SILENT_LEAD).await;
+                }
+            }
 
-            let time_sent = std::time::Instant::now();
-            sub.send(msg).await?;
-            let play_length = std::time::Duration::from_secs_f32(play_length);
+            let time_sent = Instant::now();
+            sub.send(self.talk_data_msg(msg_num, payload)).await?;
             if time_sent > expected_stream_end {
                 expected_stream_end = time_sent + play_length;
             } else {
                 expected_stream_end += play_length;
             }
-            let _ = sub.recv().await?;
+
+            if camera_answers {
+                match timeout(TALK_REPLY_TIMEOUT, sub.recv()).await {
+                    Ok(reply) => {
+                        let _ = reply?;
+                    }
+                    Err(_) => {
+                        log::warn!(
+                            "The camera did not answer a block of talk audio within {:?}. \
+                            Talk goes on without waiting for answers.",
+                            TALK_REPLY_TIMEOUT
+                        );
+                        camera_answers = false;
+                    }
+                }
+            } else {
+                // Take any late answers so they do not fill the subscription
+                while let Ok(reply) = timeout(Duration::ZERO, sub.recv()).await {
+                    let _ = reply?;
+                }
+            }
         }
 
         // Chunks are still being played, while talk_stop will interrupt them. Wait until we expect
         // the stream to end (+ and extra 100ms) before issuing talk_stop.
-        let remaining_stream_duration = expected_stream_end - std::time::Instant::now();
-        tokio::time::sleep(remaining_stream_duration + std::time::Duration::from_secs_f32(0.1))
-            .await;
+        let remaining_stream_duration =
+            expected_stream_end.saturating_duration_since(Instant::now());
+        tokio::time::sleep(remaining_stream_duration + Duration::from_millis(100)).await;
 
         self.talk_stop().await?;
 
@@ -419,64 +421,337 @@ impl BcCamera {
     }
 }
 
-struct BufferedStream {
-    rx: Receiver<Vec<u8>>,
-    buffer: Vec<u8>,
-    consumed: usize,
-}
+#[cfg(test)]
+mod tests {
+    //! An in-process fake camera: no network and no real device. Every talk
+    //! config and every audio byte here is SYNTHETIC.
+    use super::*;
+    use crate::bc_protocol::{BcConnSink, BcConnSource, BcConnection, Credentials, ReadKind};
+    use futures::{channel::mpsc::unbounded, SinkExt, StreamExt};
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicBool, AtomicU16, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use tokio::sync::RwLock;
+    use tokio_util::sync::CancellationToken;
 
-impl BufferedStream {
-    pub fn from_rx(rx: Receiver<Vec<u8>>) -> BufferedStream {
-        BufferedStream {
-            rx,
-            buffer: vec![],
-            consumed: 0,
+    /// A made-up talk config: ADPCM at 16000 Hz with 512 byte blocks.
+    fn talk_config() -> TalkConfig {
+        TalkConfig {
+            channel_id: 0,
+            duplex: "FDX".to_string(),
+            audio_stream_mode: "followVideoStream".to_string(),
+            audio_config: AudioConfig {
+                audio_type: "adpcm".to_string(),
+                sample_rate: 16000,
+                sample_precision: 16,
+                length_per_encoder: 1024,
+                sound_track: "mono".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
         }
     }
-}
 
-impl Read for BufferedStream {
-    fn read(&mut self, buf: &mut [u8]) -> IoResult<usize> {
-        let buffer = self.fill_buf()?;
-        let amt = std::cmp::min(buf.len(), buffer.len());
+    /// One ADPCM block of [`talk_config`]: 512 data bytes and a 4 byte header.
+    const FULL_BLOCK: usize = 516;
 
-        // First check if the amount of bytes we want to read is small:
-        // `copy_from_slice` will generally expand to a call to `memcpy`, and
-        // for a single byte the overhead is significant.
-        if amt == 1 {
-            buf[0] = buffer[0];
-        } else {
-            buf[..amt].copy_from_slice(&buffer[..amt]);
+    fn reply(request: &Bc, code: u16) -> Bc {
+        Bc {
+            meta: BcMeta {
+                response_code: code,
+                ..request.meta
+            },
+            body: BcBody::ModernMsg(ModernMsg::default()),
         }
-
-        self.consume(amt);
-
-        Ok(amt)
-    }
-}
-
-impl BufRead for BufferedStream {
-    fn fill_buf(&mut self) -> IoResult<&[u8]> {
-        const CLEAR_CONSUMED_AT: usize = 1024;
-        // This is a trade off between caching too much dead memory
-        // and calling the drain method too often
-        if self.consumed > CLEAR_CONSUMED_AT {
-            let _ = self.buffer.drain(0..self.consumed).collect::<Vec<u8>>();
-            self.consumed = 0;
-        }
-        while self.buffer.len() <= self.consumed {
-            let data = self
-                .rx
-                .recv()
-                .map_err(|err| IoError::new(ErrorKind::ConnectionReset, err))?;
-            self.buffer.extend(data);
-        }
-
-        Ok(&self.buffer.as_slice()[self.consumed..])
     }
 
-    fn consume(&mut self, amt: usize) {
-        assert!(self.consumed + amt <= self.buffer.len());
-        self.consumed += amt;
+    /// A fake camera that keeps every message it receives. `respond` returns
+    /// the reply codes for each message, in order.
+    struct Fake {
+        camera: BcCamera,
+        received: Arc<Mutex<Vec<Bc>>>,
+    }
+
+    impl Fake {
+        async fn new<F>(mut respond: F) -> Self
+        where
+            F: FnMut(&Bc) -> Vec<u16> + Send + 'static,
+        {
+            let received = Arc::new(Mutex::new(Vec::new()));
+            let log = received.clone();
+            let (to_cam, mut cam_rx) = unbounded::<Bc>();
+            let (cam_tx, from_cam) = unbounded::<Result<Bc>>();
+            tokio::spawn(async move {
+                while let Some(request) = cam_rx.next().await {
+                    let replies: Vec<Bc> = respond(&request)
+                        .into_iter()
+                        .map(|code| reply(&request, code))
+                        .collect();
+                    // Log before replying, so a caller that has its answer
+                    // always finds its message in the log.
+                    log.lock().unwrap().push(request);
+                    for reply in replies {
+                        let _ = cam_tx.unbounded_send(Ok(reply));
+                    }
+                }
+            });
+            let sink: BcConnSink =
+                Box::new(to_cam.sink_map_err(|_| Error::Other("fake camera is gone")));
+            let source: BcConnSource = Box::new(from_cam);
+            let connection = BcConnection::new(sink, source)
+                .await
+                .expect("in-memory connection");
+            let mut abilities = HashMap::new();
+            abilities.insert("talk".to_string(), ReadKind::ReadWrite);
+            Fake {
+                camera: BcCamera {
+                    channel_id: 0,
+                    connection: Arc::new(connection),
+                    logged_in: AtomicBool::new(true),
+                    message_num: AtomicU16::new(0),
+                    credentials: Credentials::new("fake", None::<String>),
+                    abilities: RwLock::new(abilities),
+                    cancel: CancellationToken::new(),
+                },
+                received,
+            }
+        }
+
+        fn ids(&self) -> Vec<u32> {
+            self.received
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|bc| bc.meta.msg_id)
+                .collect()
+        }
+    }
+
+    /// A camera that answers every message with 200.
+    fn answers_all(_: &Bc) -> Vec<u16> {
+        vec![200]
+    }
+
+    /// The ADPCM payload `talk_stream` puts in a 202 for one block.
+    fn payload_of(block: &[u8]) -> Vec<u8> {
+        BcMedia::Adpcm(BcMediaAdpcm {
+            data: block.to_vec(),
+        })
+        .serialize(vec![])
+        .expect("serialise a synthetic block")
+    }
+
+    fn binary(bc: &Bc) -> Vec<u8> {
+        match &bc.body {
+            BcBody::ModernMsg(ModernMsg {
+                payload: Some(BcPayloads::Binary(data)),
+                ..
+            }) => data.clone(),
+            other => panic!("expected a binary payload, got {:?}", other),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn talk_does_not_block_the_runtime() {
+        let fake = Fake::new(answers_all).await;
+        // Eight payloads of four blocks: about 2 seconds of audio at 16000 Hz.
+        let adpcm = vec![0x11u8; FULL_BLOCK * 4 * 8];
+
+        let ticks = Arc::new(AtomicUsize::new(0));
+        let counter = ticks.clone();
+        let ticker = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_millis(50));
+            loop {
+                interval.tick().await;
+                counter.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+
+        let started = Instant::now();
+        fake.camera
+            .talk(&adpcm, talk_config(), TalkOnBusy::Preempt)
+            .await
+            .expect("talk");
+        let elapsed = started.elapsed();
+        let ticked = ticks.load(Ordering::SeqCst);
+        ticker.abort();
+
+        assert!(
+            elapsed >= Duration::from_millis(1800),
+            "talk took {:?}",
+            elapsed
+        );
+        // A blocking sleep starves the ticker. A tokio sleep lets it run about
+        // 40 times. The bar sits well under that for a loaded host.
+        assert!(
+            ticked >= 20,
+            "the timer ticked {} times in {:?}",
+            ticked,
+            elapsed
+        );
+    }
+
+    #[tokio::test]
+    async fn talk_422_resends_the_request() {
+        let mut configs = 0;
+        let fake = Fake::new(move |bc| {
+            if bc.meta.msg_id == MSG_ID_TALKCONFIG {
+                configs += 1;
+                if configs == 1 {
+                    return vec![422];
+                }
+            }
+            vec![200]
+        })
+        .await;
+
+        fake.camera
+            .talk(&[0x22u8; FULL_BLOCK], talk_config(), TalkOnBusy::Preempt)
+            .await
+            .expect("talk after a 422");
+
+        let received = fake.received.lock().unwrap();
+        let ids: Vec<u32> = received.iter().map(|bc| bc.meta.msg_id).collect();
+        assert_eq!(
+            ids,
+            vec![
+                MSG_ID_TALKCONFIG,
+                MSG_ID_TALKRESET,
+                MSG_ID_TALKCONFIG,
+                MSG_ID_TALK,
+                MSG_ID_TALKRESET
+            ]
+        );
+        assert_eq!(
+            received[0], received[2],
+            "the retry is not the first request"
+        );
+        assert_eq!(received[0].meta.response_code, 0);
+        match &received[2].body {
+            BcBody::ModernMsg(ModernMsg {
+                payload:
+                    Some(BcPayloads::BcXml(BcXml {
+                        talk_config: Some(sent),
+                        ..
+                    })),
+                ..
+            }) => assert_eq!(sent, &talk_config()),
+            other => panic!("the retry carries no talk config: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn talk_busy_fails_when_asked() {
+        let fake = Fake::new(|bc| {
+            if bc.meta.msg_id == MSG_ID_TALKCONFIG {
+                vec![422]
+            } else {
+                vec![200]
+            }
+        })
+        .await;
+
+        let result = fake
+            .camera
+            .talk(&[0x33u8; FULL_BLOCK], talk_config(), TalkOnBusy::Fail)
+            .await;
+        assert!(matches!(result, Err(Error::TalkBusy)), "got {:?}", result);
+
+        let (_tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
+        let result = fake
+            .camera
+            .talk_stream(&mut rx, talk_config(), TalkOnBusy::Fail)
+            .await;
+        assert!(matches!(result, Err(Error::TalkBusy)), "got {:?}", result);
+
+        // Let any stray message reach the fake before reading its log.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(fake.ids(), vec![MSG_ID_TALKCONFIG, MSG_ID_TALKCONFIG]);
+    }
+
+    /// Three distinct synthetic blocks.
+    fn three_blocks() -> Vec<Vec<u8>> {
+        (1..=3u8).map(|n| vec![n; FULL_BLOCK]).collect()
+    }
+
+    /// Sends the blocks into a channel in frames that do not line up with the
+    /// block edges, then closes it.
+    fn send_in_odd_frames(blocks: &[Vec<u8>]) -> tokio::sync::mpsc::Receiver<Vec<u8>> {
+        let all: Vec<u8> = blocks.concat();
+        let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+        tokio::spawn(async move {
+            for frame in all.chunks(300) {
+                tx.send(frame.to_vec()).await.expect("talk_stream reads");
+                tokio::task::yield_now().await;
+            }
+        });
+        rx
+    }
+
+    #[tokio::test]
+    async fn talk_stream_reads_async() {
+        let fake = Fake::new(answers_all).await;
+        let blocks = three_blocks();
+        let mut rx = send_in_odd_frames(&blocks);
+
+        fake.camera
+            .talk_stream(&mut rx, talk_config(), TalkOnBusy::Preempt)
+            .await
+            .expect("talk_stream");
+
+        let received = fake.received.lock().unwrap();
+        let ids: Vec<u32> = received.iter().map(|bc| bc.meta.msg_id).collect();
+        assert_eq!(
+            ids,
+            vec![
+                MSG_ID_TALKCONFIG,
+                MSG_ID_TALK,
+                MSG_ID_TALK,
+                MSG_ID_TALK,
+                MSG_ID_TALKRESET
+            ]
+        );
+        for (i, block) in blocks.iter().enumerate() {
+            assert_eq!(binary(&received[i + 1]), payload_of(block), "block {i}");
+        }
+    }
+
+    #[tokio::test]
+    async fn talk_stream_survives_a_silent_camera() {
+        let fake = Fake::new(|bc| {
+            if bc.meta.msg_id == MSG_ID_TALK {
+                vec![]
+            } else {
+                vec![200]
+            }
+        })
+        .await;
+        let blocks = three_blocks();
+        let mut rx = send_in_odd_frames(&blocks);
+
+        timeout(
+            Duration::from_secs(10),
+            fake.camera
+                .talk_stream(&mut rx, talk_config(), TalkOnBusy::Preempt),
+        )
+        .await
+        .expect("talk_stream hung on a silent camera")
+        .expect("talk_stream");
+
+        let received = fake.received.lock().unwrap();
+        let ids: Vec<u32> = received.iter().map(|bc| bc.meta.msg_id).collect();
+        assert_eq!(
+            ids,
+            vec![
+                MSG_ID_TALKCONFIG,
+                MSG_ID_TALK,
+                MSG_ID_TALK,
+                MSG_ID_TALK,
+                MSG_ID_TALKRESET
+            ]
+        );
+        for (i, block) in blocks.iter().enumerate() {
+            assert_eq!(binary(&received[i + 1]), payload_of(block), "block {i}");
+        }
     }
 }
