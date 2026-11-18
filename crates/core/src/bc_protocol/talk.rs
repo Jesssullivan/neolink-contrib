@@ -429,7 +429,7 @@ mod tests {
     use crate::bc_protocol::{BcConnSink, BcConnSource, BcConnection, Credentials, ReadKind};
     use futures::{channel::mpsc::unbounded, SinkExt, StreamExt};
     use std::collections::HashMap;
-    use std::sync::atomic::{AtomicBool, AtomicU16, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU16};
     use std::sync::{Arc, Mutex};
     use tokio::sync::RwLock;
     use tokio_util::sync::CancellationToken;
@@ -557,15 +557,21 @@ mod tests {
         // Eight payloads of four blocks: about 2 seconds of audio at 16000 Hz.
         let adpcm = vec![0x11u8; FULL_BLOCK * 4 * 8];
 
-        let ticks = Arc::new(AtomicUsize::new(0));
-        let counter = ticks.clone();
+        // The ticker records the time of each tick. Skip keeps a starved
+        // ticker from firing its missed ticks in a burst, so a blocked runtime
+        // shows as one long gap between two ticks.
+        let ticks = Arc::new(Mutex::new(Vec::<Instant>::new()));
+        let log = ticks.clone();
         let ticker = tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_millis(50));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 interval.tick().await;
-                counter.fetch_add(1, Ordering::SeqCst);
+                log.lock().unwrap().push(Instant::now());
             }
         });
+        // Let the ticker take its first tick before the talk starts.
+        tokio::task::yield_now().await;
 
         let started = Instant::now();
         fake.camera
@@ -573,21 +579,30 @@ mod tests {
             .await
             .expect("talk");
         let elapsed = started.elapsed();
-        let ticked = ticks.load(Ordering::SeqCst);
         ticker.abort();
+        let mut times = ticks.lock().unwrap().clone();
+        times.push(Instant::now());
 
         assert!(
             elapsed >= Duration::from_millis(1800),
             "talk took {:?}",
             elapsed
         );
-        // A blocking sleep starves the ticker. A tokio sleep lets it run about
-        // 40 times. The bar sits well under that for a loaded host.
+        // One payload of four blocks plays for 256 milliseconds. A blocking
+        // sleep of one payload leaves a gap at least that long. A tokio sleep
+        // leaves gaps near 50 milliseconds. The bar leaves room for a loaded
+        // host and stays under one payload.
+        let largest_gap = times
+            .windows(2)
+            .map(|pair| pair[1].duration_since(pair[0]))
+            .max()
+            .expect("at least two ticks");
         assert!(
-            ticked >= 20,
-            "the timer ticked {} times in {:?}",
-            ticked,
-            elapsed
+            largest_gap < Duration::from_millis(200),
+            "the timer stalled for {:?} during a talk of {:?}, {} ticks",
+            largest_gap,
+            elapsed,
+            times.len()
         );
     }
 
