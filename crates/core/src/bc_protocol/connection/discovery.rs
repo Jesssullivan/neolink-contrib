@@ -2435,9 +2435,9 @@ mod tests {
         futures::future::join_all(silent.iter().map(assert_silent)).await;
         assert_eq!(discovery.discoverer.refused_destinations(), 0);
 
-        // What the writer was allowed and what it sent are exactly the two
-        // camera ports. A plan that grew a broadcast fails here, even though
-        // the loopback sockets above would never see one.
+        // What the writer was allowed is exactly the two camera ports. A plan
+        // that grew a broadcast fails here, even though the loopback sockets
+        // above would never see one.
         let want: HashSet<SocketAddr> = [sa("127.0.0.2:2015"), sa("127.0.0.2:2018")]
             .iter()
             .copied()
@@ -2446,9 +2446,17 @@ mod tests {
             discovery.discoverer.allowed_destinations(),
             Some(want.clone())
         );
+        // What it sent holds the port that answered and nothing outside the
+        // two. Discovery returns on the first answer, so the send to the
+        // other port may not have happened yet.
         let sent = discovery.discoverer.sent_destinations();
         let sent_set: HashSet<SocketAddr> = sent.iter().copied().collect();
-        assert_eq!(sent_set, want, "the writer sent to {:?}", sent);
+        assert!(sent_set.is_subset(&want), "the writer sent to {:?}", sent);
+        assert!(
+            sent_set.contains(&found.get_addr()),
+            "the writer sent to {:?}",
+            sent
+        );
         Ok(())
     }
 

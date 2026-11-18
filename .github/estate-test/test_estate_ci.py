@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import stat
 import subprocess
@@ -341,6 +342,53 @@ class GstElementCheck(unittest.TestCase):
 
     def test_no_element_named_fails(self):
         self.assertEqual(self.run_check([], []).returncode, 2)
+
+
+# A log macro call and the start of its argument list.
+LOG_MACRO = re.compile(r"\b(?:log::)?(?:trace|debug|info|warn|error)!\s*\(")
+# A read of a UID field or a call of a UID accessor, such as camera.uid().
+UID_READ = re.compile(r"\.uid\b|\buid\s*\(\s*\)")
+
+
+def log_macro_args(source: str):
+    """Yield the line and the argument text of each log macro call in source."""
+    for m in LOG_MACRO.finditer(source):
+        depth, i = 1, m.end()
+        while i < len(source) and depth:
+            depth += {"(": 1, ")": -1}.get(source[i], 0)
+            i += 1
+        yield source.count("\n", 0, m.start()) + 1, source[m.end():i - 1]
+
+
+def uid_log_lines(root: Path):
+    """List each log macro call under src/ and crates/ that reads a UID."""
+    hits = []
+    for top in ("src", "crates"):
+        for path in sorted((root / top).rglob("*.rs")):
+            for line, args in log_macro_args(path.read_text()):
+                if UID_READ.search(args):
+                    hits.append(f"{path.relative_to(root)}:{line}")
+    return hits
+
+
+class NoUidInLogLines(unittest.TestCase):
+    """Guard: no log macro prints a camera UID it reads from a camera or a config (TIN-8563)."""
+
+    def test_scanner_finds_a_uid_read(self):
+        source = 'log::debug!(\n    "Registered {}: {:?}",\n    camera.uid().await?,\n    r\n);\n'
+        self.assertEqual([line for line, _ in log_macro_args(source)], [1])
+        self.assertTrue(UID_READ.search(next(log_macro_args(source))[1]))
+        self.assertTrue(UID_READ.search('"{}", config.uid'))
+        self.assertTrue(UID_READ.search('"{}", uid()'))
+
+    def test_scanner_passes_a_line_without_a_uid(self):
+        source = 'trace!("Uid lookup to: {:?}", addrs);\nwarn!("UID: [set] {}", f(x));\n'
+        self.assertEqual(
+            [UID_READ.search(args) for _, args in log_macro_args(source)], [None, None]
+        )
+
+    def test_no_log_line_reads_a_uid(self):
+        self.assertEqual(uid_log_lines(ROOT), [])
 
 
 TREE_ARGS = (
