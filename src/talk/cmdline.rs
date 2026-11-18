@@ -1,4 +1,4 @@
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use std::path::PathBuf;
 use std::str::FromStr;
 
@@ -30,4 +30,26 @@ pub struct Opt {
     /// Use to change the volume of the input
     #[arg(short, long, default_value = "1.0")]
     pub volume: f32,
+    /// What to do when another client is talking on the camera. `preempt` resets
+    /// the camera's talk and takes over. `fail` reports busy and sends nothing.
+    #[arg(long, value_enum, default_value = "preempt")]
+    pub on_busy: OnBusy,
+}
+
+/// The command line form of [`neolink_core::bc_protocol::TalkOnBusy`]
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OnBusy {
+    /// Report busy and send nothing more
+    Fail,
+    /// Reset the camera's talk and send the request again
+    Preempt,
+}
+
+impl From<OnBusy> for neolink_core::bc_protocol::TalkOnBusy {
+    fn from(value: OnBusy) -> Self {
+        match value {
+            OnBusy::Fail => Self::Fail,
+            OnBusy::Preempt => Self::Preempt,
+        }
+    }
 }

@@ -59,6 +59,7 @@ pub use pushinfo::PhoneType;
 pub use resolution::*;
 use std::sync::Arc;
 pub use stream::{StreamData, StreamKind};
+pub use talk::TalkOnBusy;
 
 pub(crate) type Result<T> = std::result::Result<T, Error>;
 

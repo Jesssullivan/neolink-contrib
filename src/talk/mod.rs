@@ -8,11 +8,14 @@
 /// # Usage
 ///
 /// ```bash
-/// neolink talk --config=config.toml --adpcm-file=data.adpcm --sample-rate=16000 --block-size=512 CameraName
+/// neolink talk --config=config.toml --file-path=clip.wav CameraName
+/// neolink talk --config=config.toml --file-path=clip.wav --on-busy=fail CameraName
 /// ```
 ///
 use anyhow::{anyhow, Context, Result};
 use neolink_core::bc::xml::TalkConfig;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
 mod cmdline;
 mod gst;
@@ -86,12 +89,17 @@ pub(crate) async fn main(opt: Opt, reactor: NeoReactor) -> Result<()> {
         _ => unreachable!(),
     };
 
+    // run_task may run the closure again after a reconnect, so each run
+    // borrows the one receiver in turn.
+    let rx = Arc::new(Mutex::new(rx));
+    let on_busy = opt.on_busy.into();
     camera
         .run_task(|cam| {
             let rx = rx.clone();
             let talk_config = talk_config.clone();
             Box::pin(async move {
-                cam.talk_stream(rx, talk_config).await?;
+                let mut rx = rx.lock().await;
+                cam.talk_stream(&mut rx, talk_config, on_busy).await?;
                 Ok(())
             })
         })

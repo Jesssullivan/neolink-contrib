@@ -49,6 +49,7 @@ mod reboot;
 #[cfg(feature = "gstreamer")]
 mod rtsp;
 mod services;
+mod siren;
 mod statusled;
 #[cfg(feature = "gstreamer")]
 mod talk;
@@ -113,6 +114,9 @@ async fn main() -> Result<()> {
         }
         Some(Command::Reboot(opts)) => {
             reboot::main(opts, neo_reactor.clone()).await?;
+        }
+        Some(Command::Siren(opts)) => {
+            siren::main(opts, neo_reactor.clone()).await?;
         }
         Some(Command::Pir(opts)) => {
             pir::main(opts, neo_reactor.clone()).await?;

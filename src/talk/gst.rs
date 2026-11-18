@@ -1,11 +1,11 @@
 use crate::AnyResult;
 use anyhow::{anyhow, Context, Result};
-use crossbeam_channel::{bounded, Receiver, Sender};
 use gstreamer::{
     element_error, parse::launch_full, prelude::*, Caps, ClockTime, FlowError, FlowSuccess,
     MessageView, ParseFlags, Pipeline, ResourceError, State,
 };
 use gstreamer_app::{AppSink, AppSinkCallbacks};
+use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio::task::JoinSet;
 
 use byte_slice_cast::*;
@@ -24,7 +24,7 @@ pub(super) fn from_input(
 #[allow(clippy::type_complexity)]
 fn input(pipeline: Pipeline) -> Result<(JoinSet<AnyResult<()>>, Receiver<Vec<u8>>)> {
     let appsink = get_sink(&pipeline)?;
-    let (tx, rx) = bounded(30);
+    let (tx, rx) = channel(30);
     let mut set = JoinSet::<AnyResult<()>>::new();
     set_data_channel(&appsink, tx);
 
@@ -123,8 +123,10 @@ fn set_data_channel(appsink: &AppSink, tx: Sender<Vec<u8>>) {
                     FlowError::Error
                 })?;
 
-                // Ready!
-                let _ = tx.send(samples.to_vec());
+                // Ready! This callback runs on a GStreamer streaming thread,
+                // not on the tokio runtime, so it may block until talk_stream
+                // takes the data. It fails only once talk_stream has gone.
+                let _ = tx.blocking_send(samples.to_vec());
 
                 Ok(FlowSuccess::Ok)
             })
