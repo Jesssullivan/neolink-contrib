@@ -120,7 +120,8 @@ jobs:
           --require-test rtsp::factory::pusher_end_tests::pusher_starts_for_a_camera_name_with_a_nul
           --require-test rtsp::factory::pusher_end_tests::pusher_clean_stop_logs_no_warn
 
-      # Talk paces audio with a tokio timer, resends its own request on a 422,
+      # Talk paces audio with a tokio timer, takes the camera's answers to its
+      # audio, resends its own request on a 422,
       # can fail on a busy camera and reads its input from a tokio channel. The
       # CLI has a siren subcommand. Each test is named, so a change that
       # renames, gates or ignores one fails the job.
@@ -129,6 +130,7 @@ jobs:
         run: >-
           python3 .github/estate-test/cargo_test_summary.py cargo-test.log
           --require-test bc_protocol::talk::tests::talk_does_not_block_the_runtime
+          --require-test bc_protocol::talk::tests::talk_drains_the_camera_answers
           --require-test bc_protocol::talk::tests::talk_422_resends_the_request
           --require-test bc_protocol::talk::tests::talk_busy_fails_when_asked
           --require-test bc_protocol::talk::tests::talk_stream_reads_async

@@ -37,3 +37,5 @@ test-util = []
 assert_matches = "1.5.0"
 env_logger = "*"
 indoc = "2.0.1"
+# Paused time for the talk tests.
+tokio = { version = "1.27.0", features = ["full", "test-util"] }

@@ -240,7 +240,7 @@ impl BcCamera {
         let connection = self.get_connection();
         let full_block_size = block_size + 4; // Block size + predictor state
         let msg_num = self.new_message_num();
-        let sub = connection.subscribe(MSG_ID_TALK, msg_num).await?;
+        let mut sub = connection.subscribe(MSG_ID_TALK, msg_num).await?;
 
         const BLOCK_PER_PAYLOAD: usize = 4;
         const BLOCK_HEADER_SIZE: usize = 4;
@@ -271,6 +271,14 @@ impl BcCamera {
             // Time to play the sample in seconds
             let play_length = samples_sent as f32 / sample_rate as f32;
             tokio::time::sleep(Duration::from_secs_f32(play_length)).await;
+
+            // Take the camera's answers to the blocks sent so far. The
+            // subscription holds 100 messages. Once it is full the connection
+            // waits on it and every other subscriber stalls, the reply to
+            // talk_stop included.
+            while let Ok(reply) = timeout(Duration::ZERO, sub.recv()).await {
+                let _ = reply?;
+            }
         }
 
         self.talk_stop().await?;
@@ -604,6 +612,30 @@ mod tests {
             elapsed,
             times.len()
         );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn talk_drains_the_camera_answers() {
+        let fake = Fake::new(answers_all).await;
+        // 120 payloads of four blocks, more than the 100 messages a
+        // subscription holds: about 31 seconds of audio at 16000 Hz. Paused
+        // time runs it at once.
+        let payloads = 120;
+        let adpcm = vec![0x44u8; FULL_BLOCK * 4 * payloads];
+
+        timeout(
+            Duration::from_secs(600),
+            fake.camera.talk(&adpcm, talk_config(), TalkOnBusy::Preempt),
+        )
+        .await
+        .expect("talk hung once the camera answered 100 payloads")
+        .expect("talk");
+
+        let ids = fake.ids();
+        assert_eq!(ids.len(), payloads + 2, "ids {:?}", ids);
+        assert_eq!(ids.first(), Some(&MSG_ID_TALKCONFIG));
+        assert!(ids[1..=payloads].iter().all(|id| *id == MSG_ID_TALK));
+        assert_eq!(ids.last(), Some(&MSG_ID_TALKRESET));
     }
 
     #[tokio::test]
