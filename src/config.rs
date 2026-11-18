@@ -126,7 +126,11 @@ impl StreamConfig {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize, Validate, Clone, PartialEq)]
+/// One camera of the config.
+///
+/// Its `Debug` output shows whether a UID or a password is set and never the
+/// value itself.
+#[derive(Deserialize, Serialize, Validate, Clone, PartialEq)]
 #[validate(schema(function = "validate_camera_config"))]
 pub(crate) struct CameraConfig {
     pub(crate) name: String,
@@ -233,6 +237,39 @@ pub(crate) struct CameraConfig {
     /// and encoded again in this codec.
     #[serde(default)]
     pub(crate) audio_codec: AudioCodec,
+}
+
+impl std::fmt::Debug for CameraConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CameraConfig")
+            .field("name", &self.name)
+            .field("camera_addr", &self.camera_addr)
+            .field("camera_uid", &self.camera_uid.as_ref().map(|_| "[set]"))
+            .field("username", &self.username)
+            .field("password", &self.password.as_ref().map(|_| "[set]"))
+            .field("stream", &self.stream)
+            .field("permitted_users", &self.permitted_users)
+            .field("channel_id", &self.channel_id)
+            .field("mqtt", &self.mqtt)
+            .field("pause", &self.pause)
+            .field("discovery", &self.discovery)
+            .field("discovery_scope", &self.discovery_scope)
+            .field("discovery_interface", &self.discovery_interface)
+            .field("max_encryption", &self.max_encryption)
+            .field("strict", &self.strict)
+            .field("print_format", &self.print_format)
+            .field("update_time", &self.update_time)
+            .field("buffer_duration", &self.buffer_duration)
+            .field("enabled", &self.enabled)
+            .field("debug", &self.debug)
+            .field("use_splash", &self.use_splash)
+            .field("splash_pattern", &self.splash_pattern)
+            .field("max_discovery_retries", &self.max_discovery_retries)
+            .field("push_notifications", &self.push_notifications)
+            .field("idle_disconnect", &self.idle_disconnect)
+            .field("audio_codec", &self.audio_codec)
+            .finish()
+    }
 }
 
 /// The name of a discovery scope in the camera config.
@@ -641,6 +678,25 @@ mod discovery_scope_tests {
             config.cameras[0].discovery_scope(),
             DiscoveryScope::Interface("bench0".to_string())
         );
+    }
+
+    #[test]
+    fn camera_config_debug_hides_the_uid() {
+        // A made-up UID and password, not in the shape of real ones.
+        let uid = "not-a-real-uid-5e1d";
+        let password = "not-a-real-pass-7c2a";
+        let config = camera_with(&format!("uid = \"{uid}\"\npassword = \"{password}\""));
+        let shown = format!("{:?}", config.cameras[0]);
+        assert!(!shown.contains(uid), "the UID is in {}", shown);
+        assert!(!shown.contains(password), "the password is in {}", shown);
+        assert!(shown.contains("name: \"cam\""), "the name is missing");
+        assert!(shown.contains("camera_uid: Some(\"[set]\")"), "{}", shown);
+        assert!(shown.contains("password: Some(\"[set]\")"), "{}", shown);
+
+        let config = camera_with("");
+        let shown = format!("{:?}", config.cameras[0]);
+        assert!(shown.contains("camera_uid: None"), "{}", shown);
+        assert!(shown.contains("password: None"), "{}", shown);
     }
 
     #[test]

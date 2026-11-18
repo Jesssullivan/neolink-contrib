@@ -125,6 +125,7 @@ jobs:
           --require-test bc_protocol::connection::discovery::tests::guard_drops_an_unplanned_destination
           --require-test bc_protocol::connection::discovery::tests::targets_scope_finds_a_loopback_camera
           --require-test bc_protocol::connection::discovery::tests::no_uid_in_discovery_logs
+          --require-test config::discovery_scope_tests::camera_config_debug_hides_the_uid
 
       - name: pusher_end_tests_ran
         if: ${{ !cancelled() }}

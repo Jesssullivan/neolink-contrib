@@ -114,12 +114,18 @@ pub(crate) struct Discoverer {
 /// With no allowed set, which is the default and the `All` scope, every
 /// destination passes. Once a scoped discovery sets the allowed set, a packet
 /// to any other destination is dropped, counted and logged at error with the
-/// destination only. This holds even for a later code path that sends without
-/// the planner.
+/// destination only. It covers only packets that pass through this writer.
+/// The keep-alive senders and the session after discovery write to the same
+/// socket without the writer, so the guard does not cover them. The
+/// keep-alive senders write to the address in the connect result.
 #[derive(Clone, Default)]
 struct DestinationGuard {
     allowed: Arc<std::sync::RwLock<Option<HashSet<SocketAddr>>>>,
     refused: Arc<AtomicUsize>,
+    /// Every destination the writer handed to the socket, in order. Tests
+    /// read it to see what left the host.
+    #[cfg(test)]
+    sent: Arc<std::sync::Mutex<Vec<SocketAddr>>>,
 }
 
 impl DestinationGuard {
@@ -140,6 +146,18 @@ impl DestinationGuard {
             None => true,
             Some(allowed) => allowed.contains(dest),
         }
+    }
+
+    /// Notes that the writer handed a packet for `dest` to the socket. Only
+    /// a test build keeps the record.
+    fn note_sent(&self, dest: &SocketAddr) {
+        #[cfg(test)]
+        self.sent
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(*dest);
+        #[cfg(not(test))]
+        let _ = dest;
     }
 
     fn refuse(&self, dest: &SocketAddr) {
@@ -240,7 +258,9 @@ impl Discoverer {
                     let mut sinker_rx = ReceiverStream::new(sinker_rx);
                     while let Some(Ok(packet)) = sinker_rx.next().await {
                         if thread_guard.admits(&packet.1) {
+                            let dest = packet.1;
                             let _ = writer.send(packet).await;
+                            thread_guard.note_sent(&dest);
                         } else {
                             thread_guard.refuse(&packet.1);
                         }
@@ -273,6 +293,26 @@ impl Discoverer {
     #[cfg(test)]
     fn refused_destinations(&self) -> usize {
         self.guard.refused.load(Ordering::SeqCst)
+    }
+
+    /// The set the writer is limited to, or `None` when it is not limited.
+    #[cfg(test)]
+    fn allowed_destinations(&self) -> Option<HashSet<SocketAddr>> {
+        self.guard
+            .allowed
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Every destination the writer has sent to so far, in order.
+    #[cfg(test)]
+    fn sent_destinations(&self) -> Vec<SocketAddr> {
+        self.guard
+            .sent
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     async fn get_socket(&self) -> Arc<UdpSocket> {
@@ -1454,7 +1494,9 @@ fn is_broadcast_like(ip: Ipv4Addr, interfaces: &[InterfaceV4]) -> bool {
 ///   this is an error.
 /// - `Interface(name)`: that interface's broadcast on each port, then each
 ///   given IPv4 host inside its subnet on each port. A given address outside
-///   it is dropped and logged. A missing interface is an error.
+///   it is dropped and logged. A missing interface is an error. So is a
+///   reported broadcast that is 255.255.255.255, unspecified, multicast or
+///   outside the interface's subnet.
 ///
 /// An error means discovery sends nothing.
 pub(crate) fn plan_destinations(
@@ -1501,6 +1543,23 @@ pub(crate) fn plan_destinations(
                     "The discovery interface is missing or has no IPv4 broadcast",
                 ));
             };
+            // The interface's own directed broadcast is the only broadcast
+            // this scope sends to. A reported broadcast that is the limited
+            // broadcast, unspecified, multicast or outside the interface's
+            // subnet is refused, and discovery sends nothing.
+            if broadcast.is_broadcast()
+                || broadcast.is_unspecified()
+                || broadcast.is_multicast()
+                || !iface.contains(broadcast)
+            {
+                warn!(
+                    "Discovery: interface {} reports the broadcast {}, which is not its own subnet broadcast, so discovery sends nothing",
+                    name, broadcast
+                );
+                return Err(Error::Other(
+                    "The discovery interface reports a broadcast outside its own subnet",
+                ));
+            }
             let mut dests = vec![];
             for &port in ports {
                 push_unique(&mut dests, SocketAddr::new(broadcast.into(), port));
@@ -2211,6 +2270,67 @@ mod tests {
             );
         }
 
+        // Interfaces that report a broadcast other than their own subnet
+        // broadcast: the limited broadcast, unspecified, multicast and the
+        // broadcast of another subnet. Each fails with no plan.
+        let mut odd = host.clone();
+        odd.push(iface(
+            "limbr0",
+            "192.0.2.130",
+            "255.255.255.128",
+            Some("255.255.255.255"),
+        ));
+        odd.push(iface(
+            "zerobr0",
+            "198.51.100.130",
+            "255.255.255.128",
+            Some("0.0.0.0"),
+        ));
+        odd.push(iface(
+            "mcastbr0",
+            "203.0.113.140",
+            "255.255.255.192",
+            Some("224.0.0.1"),
+        ));
+        odd.push(iface(
+            "farbr0",
+            "198.18.200.1",
+            "255.255.255.0",
+            Some("192.0.2.255"),
+        ));
+        // A netmask of 0.0.0.0 puts every address inside the subnet, so the
+        // subnet check passes. Each of these is caught by its own check.
+        odd.push(iface(
+            "widelim0",
+            "198.18.7.1",
+            "0.0.0.0",
+            Some("255.255.255.255"),
+        ));
+        odd.push(iface("widezero0", "198.18.8.1", "0.0.0.0", Some("0.0.0.0")));
+        odd.push(iface(
+            "widemcast0",
+            "198.18.9.1",
+            "0.0.0.0",
+            Some("224.0.0.1"),
+        ));
+        for name in [
+            "limbr0",
+            "zerobr0",
+            "mcastbr0",
+            "farbr0",
+            "widelim0",
+            "widezero0",
+            "widemcast0",
+        ] {
+            let scope = DiscoveryScope::Interface(name.to_string());
+            let given = [sa("198.18.200.9:2015")];
+            assert!(
+                plan_destinations(&scope, &odd, &given, &PORTS).is_err(),
+                "interface {} with an odd broadcast gave a plan",
+                name
+            );
+        }
+
         let silent = UdpSocket::bind("127.0.0.6:0").await?;
         let discovery = Discovery::new().await?;
         let scope = DiscoveryScope::Interface("nosuch0".to_string());
@@ -2223,6 +2343,33 @@ mod tests {
         );
         assert_silent(&silent).await;
         assert_eq!(discovery.discoverer.refused_destinations(), 0);
+        assert!(discovery.discoverer.sent_destinations().is_empty());
+
+        // An interface with an odd broadcast fails discovery the same way,
+        // with no packet handed to the socket.
+        for name in [
+            "limbr0",
+            "zerobr0",
+            "mcastbr0",
+            "farbr0",
+            "widelim0",
+            "widezero0",
+            "widemcast0",
+        ] {
+            let discovery = Discovery::new().await?;
+            let scope = DiscoveryScope::Interface(name.to_string());
+            let result = discovery
+                .local_with_interfaces(FAKE_UID, &[silent.local_addr()?], &scope, &odd)
+                .await;
+            assert!(result.is_err(), "discovery on interface {} went on", name);
+            assert_eq!(discovery.discoverer.refused_destinations(), 0);
+            assert!(
+                discovery.discoverer.sent_destinations().is_empty(),
+                "discovery on interface {} sent a packet",
+                name
+            );
+        }
+        assert_silent(&silent).await;
         Ok(())
     }
 
@@ -2287,6 +2434,21 @@ mod tests {
 
         futures::future::join_all(silent.iter().map(assert_silent)).await;
         assert_eq!(discovery.discoverer.refused_destinations(), 0);
+
+        // What the writer was allowed and what it sent are exactly the two
+        // camera ports. A plan that grew a broadcast fails here, even though
+        // the loopback sockets above would never see one.
+        let want: HashSet<SocketAddr> = [sa("127.0.0.2:2015"), sa("127.0.0.2:2018")]
+            .iter()
+            .copied()
+            .collect();
+        assert_eq!(
+            discovery.discoverer.allowed_destinations(),
+            Some(want.clone())
+        );
+        let sent = discovery.discoverer.sent_destinations();
+        let sent_set: HashSet<SocketAddr> = sent.iter().copied().collect();
+        assert_eq!(sent_set, want, "the writer sent to {:?}", sent);
         Ok(())
     }
 

@@ -295,6 +295,7 @@ class RequiredTests(unittest.TestCase):
             ("crates/core/src/bc_protocol/connection/discovery.rs", "mod tests {", DISCOVERY_TID_TESTS),
             ("crates/core/src/bc_protocol/connection/discovery.rs", "mod tests {", DISCOVERY_SCOPE_TESTS),
             ("src/rtsp/factory.rs", "mod pusher_end_tests {", PUSHER_END_TESTS),
+            ("src/config.rs", "mod discovery_scope_tests {", CAMERA_CONFIG_DEBUG_TESTS),
         ):
             source = (ROOT / path).read_text()
             self.assertIn(module, source)
@@ -450,6 +451,11 @@ DISCOVERY_SCOPE_TESTS = [
         "no_uid_in_discovery_logs",
     )
 ]
+# The test that keeps the UID and the password out of the camera config's
+# Debug output (TIN-8563). The scope step names it after the tests above.
+CAMERA_CONFIG_DEBUG_TESTS = [
+    "config::discovery_scope_tests::camera_config_debug_hides_the_uid",
+]
 
 # The tests that read the warn line a frame pusher leaves when it ends.
 PUSHER_END_TESTS = [
@@ -501,7 +507,10 @@ GATING_STEPS = {
     ("estate-test", "discovery_scope_tests_ran"): {
         "if": "${{ !cancelled() }}",
         "run": "python3 .github/estate-test/cargo_test_summary.py cargo-test.log "
-               + " ".join(f"--require-test {t}" for t in DISCOVERY_SCOPE_TESTS),
+               + " ".join(
+                   f"--require-test {t}"
+                   for t in DISCOVERY_SCOPE_TESTS + CAMERA_CONFIG_DEBUG_TESTS
+               ),
     },
     ("estate-test", "pusher_end_tests_ran"): {
         "if": "${{ !cancelled() }}",
