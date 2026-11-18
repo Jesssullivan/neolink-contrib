@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import stat
 import subprocess
@@ -293,7 +294,9 @@ class RequiredTests(unittest.TestCase):
         """Each test the two steps name exists in its source file, in its module."""
         for path, module, tests in (
             ("crates/core/src/bc_protocol/connection/discovery.rs", "mod tests {", DISCOVERY_TID_TESTS),
+            ("crates/core/src/bc_protocol/connection/discovery.rs", "mod tests {", DISCOVERY_SCOPE_TESTS),
             ("src/rtsp/factory.rs", "mod pusher_end_tests {", PUSHER_END_TESTS),
+            ("src/config.rs", "mod discovery_scope_tests {", CAMERA_CONFIG_DEBUG_TESTS),
         ):
             source = (ROOT / path).read_text()
             self.assertIn(module, source)
@@ -339,6 +342,53 @@ class GstElementCheck(unittest.TestCase):
 
     def test_no_element_named_fails(self):
         self.assertEqual(self.run_check([], []).returncode, 2)
+
+
+# A log macro call and the start of its argument list.
+LOG_MACRO = re.compile(r"\b(?:log::)?(?:trace|debug|info|warn|error)!\s*\(")
+# A read of a UID field or a call of a UID accessor, such as camera.uid().
+UID_READ = re.compile(r"\.uid\b|\buid\s*\(\s*\)")
+
+
+def log_macro_args(source: str):
+    """Yield the line and the argument text of each log macro call in source."""
+    for m in LOG_MACRO.finditer(source):
+        depth, i = 1, m.end()
+        while i < len(source) and depth:
+            depth += {"(": 1, ")": -1}.get(source[i], 0)
+            i += 1
+        yield source.count("\n", 0, m.start()) + 1, source[m.end():i - 1]
+
+
+def uid_log_lines(root: Path):
+    """List each log macro call under src/ and crates/ that reads a UID."""
+    hits = []
+    for top in ("src", "crates"):
+        for path in sorted((root / top).rglob("*.rs")):
+            for line, args in log_macro_args(path.read_text()):
+                if UID_READ.search(args):
+                    hits.append(f"{path.relative_to(root)}:{line}")
+    return hits
+
+
+class NoUidInLogLines(unittest.TestCase):
+    """Guard: no log macro prints a camera UID it reads from a camera or a config (TIN-8563)."""
+
+    def test_scanner_finds_a_uid_read(self):
+        source = 'log::debug!(\n    "Registered {}: {:?}",\n    camera.uid().await?,\n    r\n);\n'
+        self.assertEqual([line for line, _ in log_macro_args(source)], [1])
+        self.assertTrue(UID_READ.search(next(log_macro_args(source))[1]))
+        self.assertTrue(UID_READ.search('"{}", config.uid'))
+        self.assertTrue(UID_READ.search('"{}", uid()'))
+
+    def test_scanner_passes_a_line_without_a_uid(self):
+        source = 'trace!("Uid lookup to: {:?}", addrs);\nwarn!("UID: [set] {}", f(x));\n'
+        self.assertEqual(
+            [UID_READ.search(args) for _, args in log_macro_args(source)], [None, None]
+        )
+
+    def test_no_log_line_reads_a_uid(self):
+        self.assertEqual(uid_log_lines(ROOT), [])
 
 
 TREE_ARGS = (
@@ -435,6 +485,26 @@ DISCOVERY_TID_TESTS = [
     )
 ]
 
+# The tests that limit local discovery to a scope and keep the UID out of the
+# logs (TIN-8563).
+DISCOVERY_SCOPE_TESTS = [
+    "bc_protocol::connection::discovery::tests::" + name
+    for name in (
+        "plan_all_matches_today",
+        "plan_targets_has_no_broadcast",
+        "plan_interface_is_one_subnet",
+        "plan_missing_interface_fails_closed",
+        "guard_drops_an_unplanned_destination",
+        "targets_scope_finds_a_loopback_camera",
+        "no_uid_in_discovery_logs",
+    )
+]
+# The test that keeps the UID and the password out of the camera config's
+# Debug output (TIN-8563). The scope step names it after the tests above.
+CAMERA_CONFIG_DEBUG_TESTS = [
+    "config::discovery_scope_tests::camera_config_debug_hides_the_uid",
+]
+
 # The tests that read the warn line a frame pusher leaves when it ends.
 PUSHER_END_TESTS = [
     "rtsp::factory::pusher_end_tests::" + name
@@ -481,6 +551,14 @@ GATING_STEPS = {
         "if": "${{ !cancelled() }}",
         "run": "python3 .github/estate-test/cargo_test_summary.py cargo-test.log "
                + " ".join(f"--require-test {t}" for t in DISCOVERY_TID_TESTS),
+    },
+    ("estate-test", "discovery_scope_tests_ran"): {
+        "if": "${{ !cancelled() }}",
+        "run": "python3 .github/estate-test/cargo_test_summary.py cargo-test.log "
+               + " ".join(
+                   f"--require-test {t}"
+                   for t in DISCOVERY_SCOPE_TESTS + CAMERA_CONFIG_DEBUG_TESTS
+               ),
     },
     ("estate-test", "pusher_end_tests_ran"): {
         "if": "${{ !cancelled() }}",
@@ -580,6 +658,7 @@ class EstateTestWorkflow(unittest.TestCase):
             "estate_test_job_runs_core_tests",
             "rtsp_resubscribe_tests_ran",
             "discovery_tid_tests_ran",
+            "discovery_scope_tests_ran",
             "pusher_end_tests_ran",
         )]
         self.assertEqual(order, sorted(order))

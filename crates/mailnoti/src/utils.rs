@@ -5,7 +5,8 @@ use log::*;
 use super::config::{CameraConfig, Config};
 use anyhow::{anyhow, Context, Error, Result};
 use neolink_core::bc_protocol::{
-    BcCamera, BcCameraOpt, ConnectionProtocol, Credentials, DiscoveryMethods, MaxEncryption,
+    BcCamera, BcCameraOpt, ConnectionProtocol, Credentials, DiscoveryMethods, DiscoveryScope,
+    MaxEncryption,
 };
 use std::{
     fmt::{Display, Error as FmtError, Formatter},
@@ -24,11 +25,11 @@ pub(crate) enum AddressOrUid {
 impl Display for AddressOrUid {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), FmtError> {
         match self {
-            AddressOrUid::AddressWithUid(addr, uid, _) => {
-                write!(f, "Address: {}, UID: {}", addr, uid)
+            AddressOrUid::AddressWithUid(addr, _, _) => {
+                write!(f, "Address: {}, UID: [set]", addr)
             }
             AddressOrUid::Address(host) => write!(f, "Address: {}", host),
-            AddressOrUid::Uid(host, _) => write!(f, "UID: {}", host),
+            AddressOrUid::Uid(_, _) => write!(f, "UID: [set]"),
         }
     }
 }
@@ -88,6 +89,7 @@ impl AddressOrUid {
             uid: camera_config.camera_uid.clone(),
             protocol: ConnectionProtocol::TcpUdp,
             discovery: camera_config.discovery,
+            discovery_scope: DiscoveryScope::All,
             max_discovery_retries: 10,
             credentials: Credentials {
                 username: camera_config.username.clone(),

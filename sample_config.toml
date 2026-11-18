@@ -86,6 +86,16 @@ address = "192.168.1.187:9000"
 #
 # discovery = "relay"
 
+# Each local discovery packet carries the camera UID. The variable
+# `discovery_scope` controls where local discovery sends it
+# - Possible values
+# "all" # The default. Broadcast on every interface and to 255.255.255.255, then send to the address if one is given
+# "targets" # Send to the `address` only, on ports 2015 and 2018. No broadcast at all
+# "interface" # Broadcast on the interface named by `discovery_interface` only, and send to the address if it is on that interface
+#
+# discovery_scope = "all"
+# discovery_interface = "eth0"
+
 # Certain types of camera emit status messages (such as battery levels)
 #
 # By default we hide these status messages from the user but you can instead requst that

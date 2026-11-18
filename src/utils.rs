@@ -31,11 +31,11 @@ pub(crate) enum AddressOrUid {
 impl Display for AddressOrUid {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), FmtError> {
         match self {
-            AddressOrUid::AddressWithUid(addr, uid, _) => {
-                write!(f, "Address: {}, UID: {}", addr, uid)
+            AddressOrUid::AddressWithUid(addr, _, _) => {
+                write!(f, "Address: {}, UID: [set]", addr)
             }
             AddressOrUid::Address(host) => write!(f, "Address: {}", host),
-            AddressOrUid::Uid(host, _) => write!(f, "UID: {}", host),
+            AddressOrUid::Uid(_, _) => write!(f, "UID: [set]"),
         }
     }
 }
@@ -95,6 +95,7 @@ impl AddressOrUid {
             uid: camera_config.camera_uid.clone(),
             protocol: ConnectionProtocol::TcpUdp,
             discovery: camera_config.discovery,
+            discovery_scope: camera_config.discovery_scope(),
             credentials: Credentials {
                 username: camera_config.username.clone(),
                 password: camera_config.password.clone(),
@@ -145,4 +146,28 @@ pub(crate) async fn connect_and_login(camera_config: &CameraConfig) -> Result<Bc
     info!("{}: Connected and logged in", camera_config.name);
 
     Ok(camera)
+}
+
+#[cfg(test)]
+mod address_or_uid_tests {
+    use super::AddressOrUid;
+    use neolink_core::bc_protocol::DiscoveryMethods;
+
+    /// A made-up UID, not in the shape of a real one.
+    const UID: &str = "not-a-real-uid-5e1d";
+
+    #[test]
+    fn address_or_uid_display_hides_the_uid() {
+        let with_address = AddressOrUid::AddressWithUid(
+            "192.0.2.1:9000".to_string(),
+            UID.to_string(),
+            DiscoveryMethods::Local,
+        );
+        assert_eq!(
+            with_address.to_string(),
+            "Address: 192.0.2.1:9000, UID: [set]"
+        );
+        let uid_only = AddressOrUid::Uid(UID.to_string(), DiscoveryMethods::Local);
+        assert_eq!(uid_only.to_string(), "UID: [set]");
+    }
 }

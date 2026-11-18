@@ -117,7 +117,7 @@ pub struct PortList {
 ///
 /// This will start a connection with any camera that has this UID
 /// It should be broadcasted to port 2018
-#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize, Clone)]
+#[derive(PartialEq, Eq, Default, Deserialize, Serialize, Clone)]
 pub struct C2dC {
     /// UID of the camera the client wants to connect with
     pub uid: String,
@@ -224,7 +224,7 @@ pub struct C2dT {
 /// This is from client to a reolink middle man server
 ///
 /// It should be sent to a reolink p2p sever on port 9999
-#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize, Clone)]
+#[derive(PartialEq, Eq, Default, Deserialize, Serialize, Clone)]
 pub struct C2mQ {
     /// UID to look up
     pub uid: String,
@@ -279,7 +279,7 @@ impl std::convert::TryFrom<IpPort> for std::net::SocketAddr {
 ///
 /// This is from client to the register reolink server
 ///
-#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize, Clone)]
+#[derive(PartialEq, Eq, Default, Deserialize, Serialize, Clone)]
 pub struct C2rC {
     /// The UID to register connecition request with
     pub uid: String,
@@ -438,6 +438,87 @@ pub struct D2cHb {
     pub cid: i32,
     /// The camera connection ID
     pub did: i32,
+}
+
+/// What the `Debug` output of a message shows in place of its UID. The
+/// codec logs every packet it encodes at trace level, so the UID itself
+/// must not appear there.
+fn uid_shown(uid: &str) -> &'static str {
+    if uid.is_empty() {
+        ""
+    } else {
+        "[set]"
+    }
+}
+
+impl std::fmt::Debug for C2dC {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("C2dC")
+            .field("uid", &uid_shown(&self.uid))
+            .field("cli", &self.cli)
+            .field("cid", &self.cid)
+            .field("mtu", &self.mtu)
+            .field("debug", &self.debug)
+            .field("os", &self.os)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for C2mQ {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("C2mQ")
+            .field("uid", &uid_shown(&self.uid))
+            .field("os", &self.os)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for C2rC {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("C2rC")
+            .field("uid", &uid_shown(&self.uid))
+            .field("cli", &self.cli)
+            .field("relay", &self.relay)
+            .field("cid", &self.cid)
+            .field("debug", &self.debug)
+            .field("family", &self.family)
+            .field("os", &self.os)
+            .field("revision", &self.revision)
+            .finish()
+    }
+}
+
+#[test]
+fn uid_messages_debug_hides_the_uid() {
+    // A made-up UID, not in the shape of a real one.
+    let uid = "not-a-real-uid-5e1d";
+    let shown = [
+        format!(
+            "{:?}",
+            UdpXml::C2dC(C2dC {
+                uid: uid.to_string(),
+                ..Default::default()
+            })
+        ),
+        format!(
+            "{:?}",
+            C2mQ {
+                uid: uid.to_string(),
+                ..Default::default()
+            }
+        ),
+        format!(
+            "{:?}",
+            C2rC {
+                uid: uid.to_string(),
+                ..Default::default()
+            }
+        ),
+    ];
+    for text in shown {
+        assert!(!text.contains(uid), "the UID is in {}", text);
+        assert!(text.contains("uid: \"[set]\""), "{}", text);
+    }
 }
 
 /// This test was added because of issues with Argus3 during discovery

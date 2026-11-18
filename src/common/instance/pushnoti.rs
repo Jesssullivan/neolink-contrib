@@ -32,7 +32,7 @@ impl NeoInstance {
                     .await
                 {
                     Ok(pn) => {
-                        log::trace!("Forwarding push notification about {}", uid);
+                        log::trace!("Forwarding a push notification for this camera");
                         let _ = fwatch_tx.send_replace(pn.clone());
                     }
                     Err(e) => {

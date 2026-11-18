@@ -1,7 +1,7 @@
 use crate::mqtt::Discoveries;
 #[cfg(feature = "gstreamer")]
 use neolink_core::bc_protocol::StreamKind;
-use neolink_core::bc_protocol::{DiscoveryMethods, PrintFormat};
+use neolink_core::bc_protocol::{DiscoveryMethods, DiscoveryScope, PrintFormat};
 use once_cell::sync::Lazy;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -126,7 +126,11 @@ impl StreamConfig {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize, Validate, Clone, PartialEq)]
+/// One camera of the config.
+///
+/// Its `Debug` output shows whether a UID or a password is set and never the
+/// value itself.
+#[derive(Deserialize, Serialize, Validate, Clone, PartialEq)]
 #[validate(schema(function = "validate_camera_config"))]
 pub(crate) struct CameraConfig {
     pub(crate) name: String,
@@ -161,6 +165,16 @@ pub(crate) struct CameraConfig {
 
     #[serde(default = "default_discovery")]
     pub(crate) discovery: DiscoveryMethods,
+
+    /// Where local UID discovery may send its packets: `all`, the default,
+    /// `targets` or `interface`. `interface` needs `discovery_interface`.
+    #[serde(default)]
+    pub(crate) discovery_scope: DiscoveryScopeName,
+
+    /// The one interface that local UID discovery uses when
+    /// `discovery_scope` is `interface`, by name.
+    #[serde(default)]
+    pub(crate) discovery_interface: Option<String>,
 
     #[serde(default = "default_maxenc")]
     #[validate(regex(
@@ -223,6 +237,67 @@ pub(crate) struct CameraConfig {
     /// and encoded again in this codec.
     #[serde(default)]
     pub(crate) audio_codec: AudioCodec,
+}
+
+impl std::fmt::Debug for CameraConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CameraConfig")
+            .field("name", &self.name)
+            .field("camera_addr", &self.camera_addr)
+            .field("camera_uid", &self.camera_uid.as_ref().map(|_| "[set]"))
+            .field("username", &self.username)
+            .field("password", &self.password.as_ref().map(|_| "[set]"))
+            .field("stream", &self.stream)
+            .field("permitted_users", &self.permitted_users)
+            .field("channel_id", &self.channel_id)
+            .field("mqtt", &self.mqtt)
+            .field("pause", &self.pause)
+            .field("discovery", &self.discovery)
+            .field("discovery_scope", &self.discovery_scope)
+            .field("discovery_interface", &self.discovery_interface)
+            .field("max_encryption", &self.max_encryption)
+            .field("strict", &self.strict)
+            .field("print_format", &self.print_format)
+            .field("update_time", &self.update_time)
+            .field("buffer_duration", &self.buffer_duration)
+            .field("enabled", &self.enabled)
+            .field("debug", &self.debug)
+            .field("use_splash", &self.use_splash)
+            .field("splash_pattern", &self.splash_pattern)
+            .field("max_discovery_retries", &self.max_discovery_retries)
+            .field("push_notifications", &self.push_notifications)
+            .field("idle_disconnect", &self.idle_disconnect)
+            .field("audio_codec", &self.audio_codec)
+            .finish()
+    }
+}
+
+/// The name of a discovery scope in the camera config.
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, Eq, PartialEq, Default)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum DiscoveryScopeName {
+    /// Every interface's broadcast and the limited broadcast, as before.
+    #[default]
+    All,
+    /// The camera's `address` only.
+    Targets,
+    /// The interface named by `discovery_interface` only.
+    Interface,
+}
+
+impl CameraConfig {
+    /// The scope local UID discovery uses for this camera. Validation has
+    /// already refused an `interface` scope with no interface name.
+    pub(crate) fn discovery_scope(&self) -> DiscoveryScope {
+        match (self.discovery_scope, &self.discovery_interface) {
+            (DiscoveryScopeName::All, _) => DiscoveryScope::All,
+            (DiscoveryScopeName::Targets, _) => DiscoveryScope::Targets,
+            (DiscoveryScopeName::Interface, Some(name)) => DiscoveryScope::Interface(name.clone()),
+            // Not reached after validation. An empty name matches no
+            // interface, so discovery fails closed.
+            (DiscoveryScopeName::Interface, None) => DiscoveryScope::Interface(String::new()),
+        }
+    }
 }
 
 /// Codec of the audio track that `neolink rtsp` serves.
@@ -555,6 +630,83 @@ fn validate_camera_config(camera_config: &CameraConfig) -> Result<(), Validation
             "Either camera address or uid must be given",
         )),
         _ => Ok(()),
+    }?;
+    match (
+        camera_config.discovery_scope,
+        camera_config.discovery_interface.as_deref(),
+    ) {
+        (DiscoveryScopeName::Interface, None | Some("")) => Err(ValidationError::new(
+            "discovery_scope = \"interface\" needs discovery_interface",
+        )),
+        (DiscoveryScopeName::All | DiscoveryScopeName::Targets, Some(_)) => Err(
+            ValidationError::new("discovery_interface needs discovery_scope = \"interface\""),
+        ),
+        _ => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod discovery_scope_tests {
+    use super::Config;
+    use neolink_core::bc_protocol::DiscoveryScope;
+    use validator::Validate;
+
+    fn camera_with(extra: &str) -> Config {
+        toml::from_str(&format!(
+            "[[cameras]]\nname = \"cam\"\nusername = \"admin\"\naddress = \"192.0.2.1:9000\"\n{extra}\n"
+        ))
+        .expect("the config parses")
+    }
+
+    #[test]
+    fn config_default_scope_is_all() {
+        let config = camera_with("");
+        assert!(config.validate().is_ok());
+        assert_eq!(config.cameras[0].discovery_scope(), DiscoveryScope::All);
+    }
+
+    #[test]
+    fn config_reads_every_scope() {
+        let config = camera_with("discovery_scope = \"targets\"");
+        assert!(config.validate().is_ok());
+        assert_eq!(config.cameras[0].discovery_scope(), DiscoveryScope::Targets);
+
+        let config =
+            camera_with("discovery_scope = \"interface\"\ndiscovery_interface = \"bench0\"");
+        assert!(config.validate().is_ok());
+        assert_eq!(
+            config.cameras[0].discovery_scope(),
+            DiscoveryScope::Interface("bench0".to_string())
+        );
+    }
+
+    #[test]
+    fn camera_config_debug_hides_the_uid() {
+        // A made-up UID and password, not in the shape of real ones.
+        let uid = "not-a-real-uid-5e1d";
+        let password = "not-a-real-pass-7c2a";
+        let config = camera_with(&format!("uid = \"{uid}\"\npassword = \"{password}\""));
+        let shown = format!("{:?}", config.cameras[0]);
+        assert!(!shown.contains(uid), "the UID is in {}", shown);
+        assert!(!shown.contains(password), "the password is in {}", shown);
+        assert!(shown.contains("name: \"cam\""), "the name is missing");
+        assert!(shown.contains("camera_uid: Some(\"[set]\")"), "{}", shown);
+        assert!(shown.contains("password: Some(\"[set]\")"), "{}", shown);
+
+        let config = camera_with("");
+        let shown = format!("{:?}", config.cameras[0]);
+        assert!(shown.contains("camera_uid: None"), "{}", shown);
+        assert!(shown.contains("password: None"), "{}", shown);
+    }
+
+    #[test]
+    fn config_refuses_an_interface_scope_without_a_name() {
+        assert!(camera_with("discovery_scope = \"interface\"")
+            .validate()
+            .is_err());
+        assert!(camera_with("discovery_interface = \"bench0\"")
+            .validate()
+            .is_err());
     }
 }
 
