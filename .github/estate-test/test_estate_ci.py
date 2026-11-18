@@ -293,6 +293,7 @@ class RequiredTests(unittest.TestCase):
         """Each test the two steps name exists in its source file, in its module."""
         for path, module, tests in (
             ("crates/core/src/bc_protocol/connection/discovery.rs", "mod tests {", DISCOVERY_TID_TESTS),
+            ("crates/core/src/bc_protocol/connection/discovery.rs", "mod tests {", DISCOVERY_SCOPE_TESTS),
             ("src/rtsp/factory.rs", "mod pusher_end_tests {", PUSHER_END_TESTS),
         ):
             source = (ROOT / path).read_text()
@@ -435,6 +436,21 @@ DISCOVERY_TID_TESTS = [
     )
 ]
 
+# The tests that limit local discovery to a scope and keep the UID out of the
+# logs (TIN-8563).
+DISCOVERY_SCOPE_TESTS = [
+    "bc_protocol::connection::discovery::tests::" + name
+    for name in (
+        "plan_all_matches_today",
+        "plan_targets_has_no_broadcast",
+        "plan_interface_is_one_subnet",
+        "plan_missing_interface_fails_closed",
+        "guard_drops_an_unplanned_destination",
+        "targets_scope_finds_a_loopback_camera",
+        "no_uid_in_discovery_logs",
+    )
+]
+
 # The tests that read the warn line a frame pusher leaves when it ends.
 PUSHER_END_TESTS = [
     "rtsp::factory::pusher_end_tests::" + name
@@ -481,6 +497,11 @@ GATING_STEPS = {
         "if": "${{ !cancelled() }}",
         "run": "python3 .github/estate-test/cargo_test_summary.py cargo-test.log "
                + " ".join(f"--require-test {t}" for t in DISCOVERY_TID_TESTS),
+    },
+    ("estate-test", "discovery_scope_tests_ran"): {
+        "if": "${{ !cancelled() }}",
+        "run": "python3 .github/estate-test/cargo_test_summary.py cargo-test.log "
+               + " ".join(f"--require-test {t}" for t in DISCOVERY_SCOPE_TESTS),
     },
     ("estate-test", "pusher_end_tests_ran"): {
         "if": "${{ !cancelled() }}",
@@ -580,6 +601,7 @@ class EstateTestWorkflow(unittest.TestCase):
             "estate_test_job_runs_core_tests",
             "rtsp_resubscribe_tests_ran",
             "discovery_tid_tests_ran",
+            "discovery_scope_tests_ran",
             "pusher_end_tests_ran",
         )]
         self.assertEqual(order, sorted(order))

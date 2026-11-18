@@ -47,6 +47,29 @@ pub enum DiscoveryMethods {
     Debug,
 }
 
+/// Where local UID discovery may send its packets
+///
+/// Each local discovery packet carries the camera UID. The scope decides
+/// which destinations get one. It is used for UID lookup only, and only by
+/// local discovery. `Remote`, `Map` and `Relay` discovery ignore it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum DiscoveryScope {
+    /// Send to 255.255.255.255 and to the broadcast address of every IPv4
+    /// interface on ports 2015 and 2018, then to every given address. This
+    /// is what neolink has always done.
+    #[default]
+    All,
+    /// Send to the given addresses only. No broadcast is sent at all.
+    Targets,
+    /// Send to the directed broadcast of the named interface on ports 2015
+    /// and 2018, and to the given addresses inside that interface's subnet.
+    /// The discovery socket binds that interface's IPv4 address. Never sends
+    /// to 255.255.255.255. A missing interface, or one with no IPv4
+    /// broadcast, fails discovery with no packet sent.
+    Interface(String),
+}
+
 /// Used to return either the SocketAddr or the UID
 pub enum SocketAddrOrUid {
     /// When the result is a addr it will be this

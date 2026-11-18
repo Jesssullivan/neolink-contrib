@@ -4,7 +4,7 @@
 //!
 use super::DiscoveryResult;
 use crate::bc::model::*;
-use crate::bc_protocol::{md5_string, Md5Trunc, TcpSource};
+use crate::bc_protocol::{md5_string, DiscoveryScope, Md5Trunc, TcpSource};
 use crate::bcudp::codex::BcUdpCodex;
 use crate::bcudp::model::*;
 use crate::bcudp::xml::*;
@@ -18,7 +18,8 @@ use log::*;
 use rand::{seq::SliceRandom, thread_rng, Rng};
 use std::collections::{btree_map::Entry, BTreeMap, HashSet};
 use std::convert::TryInto;
-use std::net::{Ipv4Addr, SocketAddr, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::time::MissedTickBehavior;
 use tokio::{
@@ -105,6 +106,49 @@ pub(crate) struct Discoverer {
     handlers: Handlers,
     local_addr: SocketAddr,
     cancel: CancellationToken,
+    guard: DestinationGuard,
+}
+
+/// The check at the one writer of a `Discoverer`.
+///
+/// With no allowed set, which is the default and the `All` scope, every
+/// destination passes. Once a scoped discovery sets the allowed set, a packet
+/// to any other destination is dropped, counted and logged at error with the
+/// destination only. This holds even for a later code path that sends without
+/// the planner.
+#[derive(Clone, Default)]
+struct DestinationGuard {
+    allowed: Arc<std::sync::RwLock<Option<HashSet<SocketAddr>>>>,
+    refused: Arc<AtomicUsize>,
+}
+
+impl DestinationGuard {
+    fn limit_to(&self, dests: &[SocketAddr]) {
+        let mut allowed = self
+            .allowed
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *allowed = Some(dests.iter().copied().collect());
+    }
+
+    fn admits(&self, dest: &SocketAddr) -> bool {
+        let allowed = self
+            .allowed
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match allowed.as_ref() {
+            None => true,
+            Some(allowed) => allowed.contains(dest),
+        }
+    }
+
+    fn refuse(&self, dest: &SocketAddr) {
+        self.refused.fetch_add(1, Ordering::SeqCst);
+        log::error!(
+            "Discovery: refused a packet to {}, which is outside the discovery scope",
+            dest
+        );
+    }
 }
 
 fn valid_ip(ip: &str) -> bool {
@@ -121,7 +165,12 @@ fn valid_addr(ip_port: &IpPort) -> bool {
 
 impl Discoverer {
     async fn new() -> Result<Discoverer> {
-        let socket = Arc::new(connect().await?);
+        Self::new_on(Ipv4Addr::UNSPECIFIED).await
+    }
+
+    /// As `new`, with the socket bound to `bind` in place of 0.0.0.0.
+    async fn new_on(bind: Ipv4Addr) -> Result<Discoverer> {
+        let socket = Arc::new(connect(bind).await?);
         let local_addr = socket.local_addr()?;
         let inner: ArcFramedSocket = UdpFramed::new(socket.clone(), BcUdpCodex::new());
         let cancel = CancellationToken::new();
@@ -182,13 +231,19 @@ impl Discoverer {
 
         let (sinker, sinker_rx) = channel::<Result<(BcUdp, SocketAddr)>>(100);
         let thread_cancel = cancel.clone();
+        let guard = DestinationGuard::default();
+        let thread_guard = guard.clone();
         set.spawn(async move {
             tokio::select! {
                 _ = thread_cancel.cancelled() => Result::Ok(()),
                 v = async {
                     let mut sinker_rx = ReceiverStream::new(sinker_rx);
                     while let Some(Ok(packet)) = sinker_rx.next().await {
-                        let _ = writer.send(packet).await;
+                        if thread_guard.admits(&packet.1) {
+                            let _ = writer.send(packet).await;
+                        } else {
+                            thread_guard.refuse(&packet.1);
+                        }
                     }
                     Result::Ok(())
                 } => v,
@@ -204,7 +259,20 @@ impl Discoverer {
             handlers,
             local_addr,
             cancel,
+            guard,
         })
+    }
+
+    /// From now on the writer sends only to `dests`.
+    fn limit_to(&self, dests: &[SocketAddr]) {
+        self.guard.limit_to(dests);
+    }
+
+    /// How many packets the writer refused because their destination lay
+    /// outside the allowed set.
+    #[cfg(test)]
+    fn refused_destinations(&self) -> usize {
+        self.guard.refused.load(Ordering::SeqCst)
     }
 
     async fn get_socket(&self) -> Arc<UdpSocket> {
@@ -1077,6 +1145,20 @@ impl Discovery {
         })
     }
 
+    /// A discovery whose socket suits `scope`. For `Interface` the socket
+    /// binds that interface's IPv4 address, and a missing interface is an
+    /// error before any socket is made. Every other scope binds 0.0.0.0.
+    pub(crate) async fn for_scope(scope: &DiscoveryScope) -> Result<Self> {
+        let bind = match scope {
+            DiscoveryScope::Interface(name) => find_interface(name, &host_interfaces()?)?.ipv4,
+            DiscoveryScope::All | DiscoveryScope::Targets => Ipv4Addr::UNSPECIFIED,
+        };
+        Ok(Self {
+            discoverer: Discoverer::new_on(bind).await?,
+            client_id: generate_cid(),
+        })
+    }
+
     pub(crate) async fn get_registration(&self, uid: &str) -> Result<RegisterResult> {
         let lookups = self.discoverer.uid_lookup_all(uid).await?;
 
@@ -1160,6 +1242,38 @@ impl Discovery {
             debug!("Also sending to {:?}", optional_addrs);
             dests.append(&mut optional_addrs);
         }
+        self.connect_first(uid, &dests).await
+    }
+
+    /// Local discovery limited to `scope`, with the host's own interfaces.
+    /// The writer is limited to the plan before the first packet, so nothing
+    /// outside it can leave. A plan error fails discovery with no packet sent.
+    pub(crate) async fn local_in_scope(
+        &self,
+        uid: &str,
+        given: &[SocketAddr],
+        scope: &DiscoveryScope,
+    ) -> Result<DiscoveryResult> {
+        self.local_with_interfaces(uid, given, scope, &host_interfaces()?)
+            .await
+    }
+
+    async fn local_with_interfaces(
+        &self,
+        uid: &str,
+        given: &[SocketAddr],
+        scope: &DiscoveryScope,
+        interfaces: &[InterfaceV4],
+    ) -> Result<DiscoveryResult> {
+        let dests = plan_destinations(scope, interfaces, given, &[2015, 2018])?;
+        debug!("Discovery in its scope sends to {:?}", dests);
+        self.discoverer.limit_to(&dests);
+        self.connect_first(uid, &dests).await
+    }
+
+    /// Sends a direct connect to every destination at once and returns the
+    /// first camera that answers.
+    async fn connect_first(&self, uid: &str, dests: &[SocketAddr]) -> Result<DiscoveryResult> {
         let discoverer_ref = &self.discoverer;
         let client_id = self.client_id;
         let mut futures = FuturesUnordered::new();
@@ -1277,13 +1391,149 @@ fn get_local_ip() -> Result<std::net::IpAddr> {
         .unwrap_or_else(|| Err(Error::Other("No Local Ip Address Found")))
 }
 
-fn get_broadcasts(ports: &[u16]) -> Result<Vec<SocketAddr>> {
-    let mut broadcasts = vec![Ipv4Addr::BROADCAST];
-    for iface in get_if_addrs::get_if_addrs()?.iter() {
-        if let get_if_addrs::IfAddr::V4(ifacev4) = &iface.addr {
-            if let Some(broadcast) = ifacev4.broadcast.as_ref() {
-                broadcasts.push(*broadcast);
+/// An IPv4 interface address of this host, as the planner sees it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct InterfaceV4 {
+    pub(crate) name: String,
+    pub(crate) ipv4: Ipv4Addr,
+    pub(crate) netmask: Ipv4Addr,
+    pub(crate) broadcast: Option<Ipv4Addr>,
+}
+
+impl InterfaceV4 {
+    fn contains(&self, ip: Ipv4Addr) -> bool {
+        let mask = u32::from(self.netmask);
+        u32::from(ip) & mask == u32::from(self.ipv4) & mask
+    }
+}
+
+/// Every IPv4 interface address of this host, in the order the system
+/// lists them.
+fn host_interfaces() -> Result<Vec<InterfaceV4>> {
+    Ok(get_if_addrs::get_if_addrs()?
+        .into_iter()
+        .filter_map(|iface| match iface.addr {
+            get_if_addrs::IfAddr::V4(v4) => Some(InterfaceV4 {
+                name: iface.name,
+                ipv4: v4.ip,
+                netmask: v4.netmask,
+                broadcast: v4.broadcast,
+            }),
+            get_if_addrs::IfAddr::V6(_) => None,
+        })
+        .collect())
+}
+
+/// The first address of the interface `name` that has an IPv4 broadcast.
+fn find_interface<'a>(name: &str, interfaces: &'a [InterfaceV4]) -> Result<&'a InterfaceV4> {
+    interfaces
+        .iter()
+        .find(|iface| iface.name == name && iface.broadcast.is_some())
+        .ok_or(Error::Other(
+            "The discovery interface is missing or has no IPv4 broadcast",
+        ))
+}
+
+/// Whether a packet to `ip` would reach more than one host: the limited
+/// broadcast, the broadcast of any interface, an unspecified or a multicast
+/// address.
+fn is_broadcast_like(ip: Ipv4Addr, interfaces: &[InterfaceV4]) -> bool {
+    ip.is_broadcast()
+        || ip.is_unspecified()
+        || ip.is_multicast()
+        || interfaces.iter().any(|iface| iface.broadcast == Some(ip))
+}
+
+/// The destinations local discovery sends to under `scope`.
+///
+/// - `All`: 255.255.255.255 and the broadcast of every interface on each
+///   port, then every given address, as neolink has always sent.
+/// - `Targets`: each given IPv4 host on each port, in the order given,
+///   without repeats. The port of a given address is not used. A broadcast,
+///   unspecified or multicast address is dropped and logged. With none left
+///   this is an error.
+/// - `Interface(name)`: that interface's broadcast on each port, then each
+///   given IPv4 host inside its subnet on each port. A given address outside
+///   it is dropped and logged. A missing interface is an error.
+///
+/// An error means discovery sends nothing.
+pub(crate) fn plan_destinations(
+    scope: &DiscoveryScope,
+    interfaces: &[InterfaceV4],
+    given: &[SocketAddr],
+    ports: &[u16],
+) -> Result<Vec<SocketAddr>> {
+    fn push_unique(dests: &mut Vec<SocketAddr>, dest: SocketAddr) {
+        if !dests.contains(&dest) {
+            dests.push(dest);
+        }
+    }
+    match scope {
+        DiscoveryScope::All => {
+            let mut dests = broadcasts(interfaces, ports);
+            dests.extend_from_slice(given);
+            Ok(dests)
+        }
+        DiscoveryScope::Targets => {
+            let mut dests = vec![];
+            for dest in given {
+                match dest.ip() {
+                    IpAddr::V4(ip) if !is_broadcast_like(ip, interfaces) => {
+                        for &port in ports {
+                            push_unique(&mut dests, SocketAddr::new(ip.into(), port));
+                        }
+                    }
+                    _ => warn!(
+                        "Discovery: {} is not a single IPv4 host, so it is not sent to",
+                        dest
+                    ),
+                }
             }
+            if dests.is_empty() {
+                return Err(Error::Other("The discovery targets hold no address"));
+            }
+            Ok(dests)
+        }
+        DiscoveryScope::Interface(name) => {
+            let iface = find_interface(name, interfaces)?;
+            let Some(broadcast) = iface.broadcast else {
+                return Err(Error::Other(
+                    "The discovery interface is missing or has no IPv4 broadcast",
+                ));
+            };
+            let mut dests = vec![];
+            for &port in ports {
+                push_unique(&mut dests, SocketAddr::new(broadcast.into(), port));
+            }
+            for dest in given {
+                match dest.ip() {
+                    IpAddr::V4(ip) if iface.contains(ip) && !is_broadcast_like(ip, interfaces) => {
+                        for &port in ports {
+                            push_unique(&mut dests, SocketAddr::new(ip.into(), port));
+                        }
+                    }
+                    _ => warn!(
+                        "Discovery: {} lies outside interface {}, so it is not sent to",
+                        dest, name
+                    ),
+                }
+            }
+            Ok(dests)
+        }
+    }
+}
+
+fn get_broadcasts(ports: &[u16]) -> Result<Vec<SocketAddr>> {
+    Ok(broadcasts(&host_interfaces()?, ports))
+}
+
+/// 255.255.255.255 and the broadcast of every interface that has one, each
+/// on every port.
+fn broadcasts(interfaces: &[InterfaceV4], ports: &[u16]) -> Vec<SocketAddr> {
+    let mut broadcasts = vec![Ipv4Addr::BROADCAST];
+    for iface in interfaces.iter() {
+        if let Some(broadcast) = iface.broadcast.as_ref() {
+            broadcasts.push(*broadcast);
         }
     }
     let mut destinations: Vec<(Ipv4Addr, u16)> = broadcasts
@@ -1296,10 +1546,10 @@ fn get_broadcasts(ports: &[u16]) -> Result<Vec<SocketAddr>> {
         })
         .collect();
     debug!("Broadcasting to: {:?}", destinations);
-    Ok(destinations
+    destinations
         .drain(..)
         .map(|(addr, port)| SocketAddr::new(addr.into(), port))
-        .collect())
+        .collect()
 }
 
 fn generate_tid() -> u32 {
@@ -1312,7 +1562,7 @@ fn generate_cid() -> i32 {
     rng.gen()
 }
 
-async fn connect() -> Result<UdpSocket> {
+async fn connect(bind: Ipv4Addr) -> Result<UdpSocket> {
     let mut ports: Vec<u16> = (53500..54000).collect();
     {
         let mut rng = thread_rng();
@@ -1321,7 +1571,7 @@ async fn connect() -> Result<UdpSocket> {
 
     let addrs: Vec<_> = ports
         .iter()
-        .map(|&port| SocketAddr::from(([0, 0, 0, 0], port)))
+        .map(|&port| SocketAddr::from((bind, port)))
         .collect();
     let socket = UdpSocket::bind(&addrs[..]).await?;
     socket.set_broadcast(true)?;
@@ -1745,5 +1995,443 @@ mod tests {
         let (tid, _rx) = discoverer.subscribe_new().await?;
         assert_eq!(tid, freed);
         Ok(())
+    }
+
+    /// A D2C_C_R that answers a C2D_C, as a camera sends it.
+    fn connect_reply(tid: u32, cid: i32, did: i32) -> BcUdp {
+        BcUdp::Discovery(UdpDiscovery {
+            tid,
+            payload: UdpXml::D2cCr(D2cCr {
+                timer: Default::default(),
+                rsp: 0,
+                cid,
+                did,
+            }),
+        })
+    }
+
+    /// A C2D_C as local discovery sends it.
+    fn connect_request(uid: &str, tid: u32) -> BcUdp {
+        BcUdp::Discovery(UdpDiscovery {
+            tid,
+            payload: UdpXml::C2dC(C2dC {
+                uid: uid.to_string(),
+                cli: ClientList { port: 53500 },
+                cid: 7,
+                mtu: MTU,
+                debug: false,
+                os: "MAC".to_string(),
+            }),
+        })
+    }
+
+    /// Answers every C2D_C that reaches `camera`, until its socket closes.
+    async fn answer_connects(mut camera: UdpFramed<BcUdpCodex>, did: i32) {
+        while let Some(Ok((msg, from))) = camera.next().await {
+            if let BcUdp::Discovery(UdpDiscovery {
+                tid,
+                payload: UdpXml::C2dC(C2dC { cid, .. }),
+            }) = msg
+            {
+                let _ = camera.send((connect_reply(tid, cid, did), from)).await;
+            }
+        }
+    }
+
+    async fn loopback_camera(addr: &str) -> Result<UdpFramed<BcUdpCodex>> {
+        Ok(UdpFramed::new(
+            UdpSocket::bind(addr).await?,
+            BcUdpCodex::new(),
+        ))
+    }
+
+    /// Fails when `socket` receives any datagram within one second.
+    async fn assert_silent(socket: &UdpSocket) {
+        let mut buf = [0u8; 2048];
+        let got = timeout(Duration::from_secs(1), socket.recv_from(&mut buf)).await;
+        if let Ok(Ok((len, from))) = got {
+            panic!(
+                "{:?} received {} bytes from {}",
+                socket.local_addr(),
+                len,
+                from
+            );
+        }
+    }
+
+    fn sa(text: &str) -> SocketAddr {
+        text.parse().expect("a socket address")
+    }
+
+    fn iface(name: &str, ip: &str, mask: &str, broadcast: Option<&str>) -> InterfaceV4 {
+        InterfaceV4 {
+            name: name.to_string(),
+            ipv4: ip.parse().expect("an address"),
+            netmask: mask.parse().expect("a netmask"),
+            broadcast: broadcast.map(|b| b.parse().expect("a broadcast")),
+        }
+    }
+
+    /// A host in the shape of sting: loopback, four networks and 100 pod
+    /// interfaces. Every address is from a documentation or benchmark
+    /// range and is only data here.
+    fn synthetic_host() -> Vec<InterfaceV4> {
+        let mut host = vec![
+            iface("lo", "127.0.0.1", "255.0.0.0", None),
+            iface("eno1", "192.0.2.10", "255.255.255.0", Some("192.0.2.255")),
+            iface(
+                "bench0",
+                "198.51.100.20",
+                "255.255.255.0",
+                Some("198.51.100.255"),
+            ),
+            iface(
+                "wlan0",
+                "203.0.113.5",
+                "255.255.255.128",
+                Some("203.0.113.127"),
+            ),
+            iface("wg0", "203.0.113.200", "255.255.255.255", None),
+        ];
+        for n in 0..100u32 {
+            let base = u32::from(Ipv4Addr::new(198, 18, 0, 0)) + n * 4;
+            host.push(InterfaceV4 {
+                name: format!("veth{}", n),
+                ipv4: Ipv4Addr::from(base + 1),
+                netmask: Ipv4Addr::new(255, 255, 255, 252),
+                broadcast: Some(Ipv4Addr::from(base + 3)),
+            });
+        }
+        host
+    }
+
+    const PORTS: [u16; 2] = [2015, 2018];
+
+    #[test]
+    fn plan_all_matches_today() -> Result<()> {
+        let host = synthetic_host();
+        let given = [sa("192.0.2.50:2018"), sa("192.0.2.50:2015")];
+        let plan = plan_destinations(&DiscoveryScope::All, &host, &given, &PORTS)?;
+
+        // Today's list, built here by hand: the limited broadcast first, then
+        // each interface broadcast in the order the host lists them, each on
+        // 2015 then 2018, then the given addresses as they came.
+        let mut want = vec![sa("255.255.255.255:2015"), sa("255.255.255.255:2018")];
+        for b in ["192.0.2.255", "198.51.100.255", "203.0.113.127"] {
+            want.push(sa(&format!("{}:2015", b)));
+            want.push(sa(&format!("{}:2018", b)));
+        }
+        for n in 0..100u32 {
+            let b = Ipv4Addr::from(u32::from(Ipv4Addr::new(198, 18, 0, 0)) + n * 4 + 3);
+            want.push(SocketAddr::new(b.into(), 2015));
+            want.push(SocketAddr::new(b.into(), 2018));
+        }
+        want.extend_from_slice(&given);
+        assert_eq!(plan.len(), (1 + 3 + 100) * 2 + 2);
+        assert_eq!(plan, want);
+        Ok(())
+    }
+
+    #[test]
+    fn plan_targets_has_no_broadcast() -> Result<()> {
+        let host = synthetic_host();
+        let given = [
+            sa("192.0.2.50:2018"),
+            sa("192.0.2.50:2015"),
+            sa("192.0.2.50:9000"),
+            sa("255.255.255.255:2015"),
+            sa("192.0.2.255:2018"),
+            sa("198.18.0.3:2015"),
+            sa("0.0.0.0:2015"),
+            sa("224.0.0.1:2018"),
+            sa("192.0.2.50:2018"),
+        ];
+        let plan = plan_destinations(&DiscoveryScope::Targets, &host, &given, &PORTS)?;
+        assert_eq!(plan, vec![sa("192.0.2.50:2015"), sa("192.0.2.50:2018")]);
+        for dest in &plan {
+            assert!(
+                PORTS.contains(&dest.port()),
+                "{} is off 2015 and 2018",
+                dest
+            );
+            let IpAddr::V4(ip) = dest.ip() else {
+                panic!("{} is not IPv4", dest)
+            };
+            assert!(!ip.is_broadcast(), "{} is the limited broadcast", dest);
+            assert!(
+                host.iter().all(|i| i.broadcast != Some(ip)),
+                "{} is an interface broadcast",
+                dest
+            );
+        }
+
+        let only_broadcasts = [sa("255.255.255.255:2015"), sa("192.0.2.255:2018")];
+        assert!(
+            plan_destinations(&DiscoveryScope::Targets, &host, &only_broadcasts, &PORTS).is_err()
+        );
+        assert!(plan_destinations(&DiscoveryScope::Targets, &host, &[], &PORTS).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn plan_interface_is_one_subnet() -> Result<()> {
+        let host = synthetic_host();
+        let given = [
+            sa("198.51.100.77:2018"),
+            sa("198.51.100.77:2015"),
+            sa("192.0.2.50:2018"),
+            sa("198.18.0.1:2015"),
+        ];
+        let scope = DiscoveryScope::Interface("bench0".to_string());
+        let plan = plan_destinations(&scope, &host, &given, &PORTS)?;
+        assert_eq!(
+            plan,
+            vec![
+                sa("198.51.100.255:2015"),
+                sa("198.51.100.255:2018"),
+                sa("198.51.100.77:2015"),
+                sa("198.51.100.77:2018"),
+            ]
+        );
+        assert!(plan
+            .iter()
+            .all(|d| d.ip() != IpAddr::V4(Ipv4Addr::BROADCAST)));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn plan_missing_interface_fails_closed() -> Result<()> {
+        let host = synthetic_host();
+        for name in ["nosuch0", "lo", "wg0"] {
+            let scope = DiscoveryScope::Interface(name.to_string());
+            assert!(
+                plan_destinations(&scope, &host, &[], &PORTS).is_err(),
+                "interface {} gave a plan",
+                name
+            );
+        }
+
+        let silent = UdpSocket::bind("127.0.0.6:0").await?;
+        let discovery = Discovery::new().await?;
+        let scope = DiscoveryScope::Interface("nosuch0".to_string());
+        let result = discovery
+            .local_with_interfaces(FAKE_UID, &[silent.local_addr()?], &scope, &host)
+            .await;
+        assert!(
+            result.is_err(),
+            "discovery with a missing interface went on"
+        );
+        assert_silent(&silent).await;
+        assert_eq!(discovery.discoverer.refused_destinations(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn guard_drops_an_unplanned_destination() -> Result<()> {
+        let discoverer = Discoverer::new().await?;
+        let planned = UdpSocket::bind("127.0.0.7:0").await?;
+        let unplanned = UdpSocket::bind("127.0.0.3:0").await?;
+        discoverer.limit_to(&[planned.local_addr()?]);
+
+        discoverer
+            .send(connect_request(FAKE_UID, 9), unplanned.local_addr()?)
+            .await?;
+        discoverer
+            .send(connect_request(FAKE_UID, 10), planned.local_addr()?)
+            .await?;
+
+        let mut buf = [0u8; 2048];
+        timeout(Duration::from_secs(5), planned.recv_from(&mut buf))
+            .await
+            .expect("the planned destination gets its packet")?;
+        assert_silent(&unplanned).await;
+        assert_eq!(discoverer.refused_destinations(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn targets_scope_finds_a_loopback_camera() -> Result<()> {
+        let cameras = [
+            loopback_camera("127.0.0.2:2015").await?,
+            loopback_camera("127.0.0.2:2018").await?,
+        ];
+        let mut silent = vec![];
+        for addr in [
+            "127.0.0.3:2015",
+            "127.0.0.3:2018",
+            "127.0.0.4:2015",
+            "127.0.0.4:2018",
+        ] {
+            silent.push(UdpSocket::bind(addr).await?);
+        }
+
+        let scope = DiscoveryScope::Targets;
+        let discovery = Discovery::for_scope(&scope).await?;
+        let given = [sa("127.0.0.2:2018"), sa("127.0.0.2:2015")];
+        let [first, second] = cameras;
+        let found = timeout(Duration::from_secs(10), async {
+            tokio::select! {
+                result = discovery.local_in_scope(FAKE_UID, &given, &scope) => result,
+                _ = futures::future::join(answer_connects(first, 1), answer_connects(second, 2)) => {
+                    panic!("the cameras stopped answering")
+                }
+            }
+        })
+        .await
+        .expect("discovery ends")?;
+        assert_eq!(
+            found.get_addr().ip(),
+            IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2))
+        );
+        assert!(PORTS.contains(&found.get_addr().port()));
+
+        futures::future::join_all(silent.iter().map(assert_silent)).await;
+        assert_eq!(discovery.discoverer.refused_destinations(), 0);
+        Ok(())
+    }
+
+    /// A made-up UID, not in the shape of a real one, for the scope tests.
+    const FAKE_UID: &str = "not-a-real-uid-5e1d";
+    const LOG_CAMERA: &str = "lane-test-cam";
+    const LOG_CHILD_ENV: &str = "NEOLINK_CORE_UID_LOG_CHILD";
+
+    static LINES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    static CAPTURE: Capture = Capture;
+
+    /// Keeps every log record of the process it is installed in.
+    struct Capture;
+
+    impl log::Log for Capture {
+        fn enabled(&self, _: &log::Metadata) -> bool {
+            true
+        }
+        fn log(&self, record: &log::Record) {
+            LINES
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(record.args().to_string());
+        }
+        fn flush(&self) {}
+    }
+
+    fn log_test_options(scope: DiscoveryScope) -> crate::bc_protocol::BcCameraOpt {
+        crate::bc_protocol::BcCameraOpt {
+            name: LOG_CAMERA.to_string(),
+            channel_id: 0,
+            addrs: vec![IpAddr::V4(Ipv4Addr::new(127, 0, 0, 5))],
+            uid: Some(FAKE_UID.to_string()),
+            port: None,
+            protocol: crate::bc_protocol::ConnectionProtocol::Udp,
+            discovery: crate::bc_protocol::DiscoveryMethods::Local,
+            discovery_scope: scope,
+            max_discovery_retries: 1,
+            credentials: crate::bc_protocol::Credentials {
+                username: "admin".to_string(),
+                password: None,
+            },
+            debug: false,
+        }
+    }
+
+    /// The body of `no_uid_in_discovery_logs`. Other tests of this binary
+    /// install their own logger, so it runs in a process of its own, where
+    /// it is the only test and its logger is the only one.
+    #[tokio::test]
+    #[ignore = "run by no_uid_in_discovery_logs in a process of its own"]
+    async fn uid_log_child() -> Result<()> {
+        if std::env::var_os(LOG_CHILD_ENV).is_none() {
+            return Ok(());
+        }
+        log::set_logger(&CAPTURE).expect("this test runs alone in its process");
+        log::set_max_level(log::LevelFilter::Trace);
+
+        let first = loopback_camera("127.0.0.5:2015").await?;
+        let second = loopback_camera("127.0.0.5:2018").await?;
+        let found_options = log_test_options(DiscoveryScope::Targets);
+        let found = timeout(Duration::from_secs(10), async {
+            tokio::select! {
+                result = crate::bc_protocol::BcCamera::find_camera(&found_options) => result,
+                _ = futures::future::join(answer_connects(first, 1), answer_connects(second, 2)) => {
+                    panic!("the camera stopped answering")
+                }
+            }
+        })
+        .await
+        .expect("the found discovery ends");
+        assert!(
+            matches!(found, Ok(crate::bc_protocol::CameraLocation::Udp(_))),
+            "the loopback camera was not found"
+        );
+
+        let failed_options = log_test_options(DiscoveryScope::Interface("nosuch0".to_string()));
+        let failed = timeout(
+            Duration::from_secs(10),
+            crate::bc_protocol::BcCamera::find_camera(&failed_options),
+        )
+        .await
+        .expect("the failed discovery ends");
+        assert!(
+            failed.is_err(),
+            "discovery on a missing interface succeeded"
+        );
+
+        let lines = LINES
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let naming = |text: &str| {
+            lines
+                .iter()
+                .any(|line| line.contains(LOG_CAMERA) && line.contains(text))
+        };
+        assert!(
+            naming("Local discovery success"),
+            "no found line names the camera"
+        );
+        assert!(naming("failed"), "no failed line names the camera");
+        // Each offending line is shown with the UID masked.
+        let with_uid: Vec<String> = lines
+            .iter()
+            .filter(|line| line.contains(FAKE_UID))
+            .map(|line| line.replace(FAKE_UID, "<UID>"))
+            .collect();
+        assert!(
+            with_uid.is_empty(),
+            "{} of {} log lines hold the UID:\n{}",
+            with_uid.len(),
+            lines.len(),
+            with_uid.join("\n")
+        );
+        println!("uid_log_child: checked {} lines", lines.len());
+        Ok(())
+    }
+
+    #[test]
+    fn no_uid_in_discovery_logs() {
+        let exe = std::env::current_exe().expect("the test binary");
+        let out = std::process::Command::new(exe)
+            .args([
+                "bc_protocol::connection::discovery::tests::uid_log_child",
+                "--exact",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(LOG_CHILD_ENV, "1")
+            .output()
+            .expect("the child test runs");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success(),
+            "the child test failed\n{}\n{}",
+            stdout,
+            stderr
+        );
+        assert!(
+            stdout.contains("uid_log_child: checked"),
+            "the child test did not run its checks\n{}",
+            stdout
+        );
     }
 }

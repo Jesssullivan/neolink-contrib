@@ -10,7 +10,7 @@
 //!
 //! ```no_run
 //! # tokio::runtime::Runtime::new().unwrap().block_on(async {
-//! use neolink_core::bc_protocol::{BcCamera, BcCameraOpt, DiscoveryMethods, ConnectionProtocol, Credentials};
+//! use neolink_core::bc_protocol::{BcCamera, BcCameraOpt, DiscoveryMethods, DiscoveryScope, ConnectionProtocol, Credentials};
 //! let options = BcCameraOpt {
 //!     name: "CamName".to_string(),
 //!     channel_id: 0,
@@ -19,6 +19,7 @@
 //!     uid: Some("CAMUID".to_string()),
 //!     protocol: ConnectionProtocol::TcpUdp,
 //!     discovery: DiscoveryMethods::Relay,
+//!     discovery_scope: DiscoveryScope::All,
 //!     credentials: Credentials {
 //!         username: "username".to_string(),
 //!         password: Some("password".to_string()),
@@ -34,7 +35,7 @@
 //!
 //! ```no_run
 //! # tokio::runtime::Runtime::new().unwrap().block_on(async {
-//! # use neolink_core::bc_protocol::{BcCamera, BcCameraOpt, DiscoveryMethods, ConnectionProtocol, Credentials};
+//! # use neolink_core::bc_protocol::{BcCamera, BcCameraOpt, DiscoveryMethods, DiscoveryScope, ConnectionProtocol, Credentials};
 //! # let options = BcCameraOpt {
 //! #    name: "CamName".to_string(),
 //! #    channel_id: 0,
@@ -43,6 +44,7 @@
 //! #    uid: Some("CAMUID".to_string()),
 //! #    protocol: ConnectionProtocol::TcpUdp,
 //! #    discovery: DiscoveryMethods::Relay,
+//! #    discovery_scope: DiscoveryScope::All,
 //! #    credentials: Credentials {
 //! #        username: "username".to_string(),
 //! #        password: Some("password".to_string()),

@@ -85,7 +85,8 @@ pub struct BcCamera {
 }
 
 /// Options used to construct a camera
-#[derive(Debug)]
+///
+/// Its `Debug` output shows whether a UID is set and never the UID itself.
 pub struct BcCameraOpt {
     /// Name, mostly used for message logs
     pub name: String,
@@ -102,12 +103,63 @@ pub struct BcCameraOpt {
     pub protocol: ConnectionProtocol,
     /// Discovery method to allow
     pub discovery: DiscoveryMethods,
+    /// Where local UID discovery may send its packets
+    pub discovery_scope: DiscoveryScope,
     /// Maximum number of retries for discovery
     pub max_discovery_retries: usize,
     /// Credentials for login
     pub credentials: Credentials,
     /// Toggle debug print of underlying data
     pub debug: bool,
+}
+
+impl std::fmt::Debug for BcCameraOpt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BcCameraOpt")
+            .field("name", &self.name)
+            .field("channel_id", &self.channel_id)
+            .field("addrs", &self.addrs)
+            .field("uid", &self.uid.as_ref().map(|_| "[set]"))
+            .field("port", &self.port)
+            .field("protocol", &self.protocol)
+            .field("discovery", &self.discovery)
+            .field("discovery_scope", &self.discovery_scope)
+            .field("max_discovery_retries", &self.max_discovery_retries)
+            .field("credentials", &self.credentials)
+            .field("debug", &self.debug)
+            .finish()
+    }
+}
+
+#[cfg(test)]
+mod camera_opt_tests {
+    use super::*;
+
+    #[test]
+    fn camera_opt_debug_hides_the_uid() {
+        // A made-up UID, not in the shape of a real one.
+        let uid = "not-a-real-uid-5e1d";
+        let mut options = BcCameraOpt {
+            name: "lane-test-cam".to_string(),
+            channel_id: 0,
+            addrs: vec![],
+            uid: Some(uid.to_string()),
+            port: None,
+            protocol: ConnectionProtocol::Udp,
+            discovery: DiscoveryMethods::Local,
+            discovery_scope: DiscoveryScope::All,
+            max_discovery_retries: 1,
+            credentials: Credentials::new("admin", None::<String>),
+            debug: false,
+        };
+        let shown = format!("{:?}", options);
+        assert!(!shown.contains(uid), "the UID is in {}", shown);
+        assert!(shown.contains("lane-test-cam"), "the name is missing");
+        assert!(shown.contains("uid: Some(\"[set]\")"), "{}", shown);
+
+        options.uid = None;
+        assert!(format!("{:?}", options).contains("uid: None"));
+    }
 }
 
 /// Used to choose the print format of various status messages like battery levels
@@ -208,13 +260,24 @@ impl BcCamera {
                 Ok(v) = async {
                     let uid_local = uid.clone();
                     info!("{}: Trying local discovery", options.name);
-                    let result = discovery.local(&uid_local, Some(sockets)).await;
+                    let result = match &options.discovery_scope {
+                        DiscoveryScope::All => discovery.local(&uid_local, Some(sockets)).await,
+                        scope => {
+                            let result = match Discovery::for_scope(scope).await {
+                                Ok(scoped) => scoped.local_in_scope(&uid_local, &sockets, scope).await,
+                                Err(e) => Err(e),
+                            };
+                            if let Err(e) = &result {
+                                warn!("{}: Local discovery in its scope failed: {}", options.name, e);
+                            }
+                            result
+                        }
+                    };
                     match result {
                         Ok(disc) => {
                             info!(
-                                "{}: Local discovery success {} at {}",
+                                "{}: Local discovery success at {}",
                                 options.name,
-                                uid_local,
                                 disc.get_addr()
                             );
                             Ok(CameraLocation::Udp(disc))
@@ -259,9 +322,8 @@ impl BcCamera {
                             match result {
                                 Ok(disc) => {
                                     info!(
-                                        "{}: Remote discovery success {} at {}",
+                                        "{}: Remote discovery success at {}",
                                         options.name,
-                                        uid_remote,
                                         disc.get_addr()
                                     );
                                     Ok(CameraLocation::Udp(disc))
@@ -270,16 +332,14 @@ impl BcCamera {
                             }
                         }, if allow_remote => Ok(v),
                         Ok(v) = async {
-                            let uid_map = uid.clone();
                             tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
                             info!("{}: Trying map discovery", options.name);
                             let result = discovery.map(&reg_result).await;
                             match result {
                                 Ok(disc) => {
                                     info!(
-                                        "{}: Map success {} at {}",
+                                        "{}: Map success at {}",
                                         options.name,
-                                        uid_map,
                                         disc.get_addr()
                                     );
                                     Ok(CameraLocation::Udp(disc))
@@ -288,16 +348,14 @@ impl BcCamera {
                             }
                         }, if allow_map => Ok(v),
                         Ok(v) = async {
-                            let uid_relay = uid.clone();
                             tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
                             info!("{}: Trying relay discovery", options.name);
                             let result = discovery.relay(&reg_result).await;
                             match result {
                                 Ok(disc) => {
                                     info!(
-                                        "{}: Relay success {} at {}",
+                                        "{}: Relay success at {}",
                                         options.name,
-                                        uid_relay,
                                         disc.get_addr()
                                     );
                                     Ok(CameraLocation::Udp(disc))

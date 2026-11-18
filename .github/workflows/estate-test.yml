@@ -110,6 +110,22 @@ jobs:
           --require-test bc_protocol::connection::discovery::tests::every_open_destination_gets_its_own_tid
           --require-test bc_protocol::connection::discovery::tests::new_tid_is_refused_while_all_are_held
 
+      # Local discovery limited to given addresses or one interface, the
+      # guard at the discovery writer and the UID kept out of the logs
+      # (TIN-8563). Each test is named, so a change that renames, gates or
+      # ignores one fails the job.
+      - name: discovery_scope_tests_ran
+        if: ${{ !cancelled() }}
+        run: >-
+          python3 .github/estate-test/cargo_test_summary.py cargo-test.log
+          --require-test bc_protocol::connection::discovery::tests::plan_all_matches_today
+          --require-test bc_protocol::connection::discovery::tests::plan_targets_has_no_broadcast
+          --require-test bc_protocol::connection::discovery::tests::plan_interface_is_one_subnet
+          --require-test bc_protocol::connection::discovery::tests::plan_missing_interface_fails_closed
+          --require-test bc_protocol::connection::discovery::tests::guard_drops_an_unplanned_destination
+          --require-test bc_protocol::connection::discovery::tests::targets_scope_finds_a_loopback_camera
+          --require-test bc_protocol::connection::discovery::tests::no_uid_in_discovery_logs
+
       - name: pusher_end_tests_ran
         if: ${{ !cancelled() }}
         run: >-
