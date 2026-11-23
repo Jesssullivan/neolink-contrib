@@ -8,12 +8,16 @@ use std::convert::TryFrom;
 pub const DEFAULT_SNAPSHOT_LIMIT: usize = 16 * 1024 * 1024;
 
 /// Collects the binary packets of one snapshot and refuses any byte past the
-/// smaller of the caller's limit and the size the camera declared.
+/// caller's limit. The size the camera declares sets the first allocation and
+/// is not a bound. A camera may send more or fewer bytes than it declares.
+/// Neolink has always accepted those images, and upstream commit 0f28154
+/// lowered the mismatch log from warn to debug.
 #[derive(Debug)]
 struct SnapshotBuffer {
     data: Vec<u8>,
     declared: usize,
     limit: usize,
+    logged_overrun: bool,
 }
 
 impl SnapshotBuffer {
@@ -27,28 +31,45 @@ impl SnapshotBuffer {
             });
         }
         Ok(Self {
-            // declared is at most limit here, so this is the only allocation
+            // declared is at most limit here
             data: Vec::with_capacity(declared),
             declared,
             limit,
+            logged_overrun: false,
         })
     }
 
-    /// Appends one packet, or refuses it whole when it would pass the
-    /// declared size. Nothing of a refused packet is kept.
+    /// Appends one packet, or refuses it whole when it would pass the limit.
+    /// Nothing of a refused packet is kept, and the capacity never grows past
+    /// the limit.
     fn push(&mut self, chunk: &[u8]) -> Result<()> {
-        // declared <= limit, so the declared size bounds both
-        match self.data.len().checked_add(chunk.len()) {
-            Some(total) if total <= self.declared => {
-                self.data.extend_from_slice(chunk);
-                Ok(())
+        let total = match self.data.len().checked_add(chunk.len()) {
+            Some(total) if total <= self.limit => total,
+            _ => {
+                return Err(Error::SnapshotTooLarge {
+                    declared: self.declared,
+                    received: self.data.len(),
+                    limit: self.limit,
+                })
             }
-            _ => Err(Error::SnapshotTooLarge {
-                declared: self.declared,
-                received: self.data.len(),
-                limit: self.limit,
-            }),
+        };
+        if total > self.declared && !self.logged_overrun {
+            self.logged_overrun = true;
+            log::debug!(
+                "Snap is longer than its declared {} bytes, accepting up to the {} byte limit",
+                self.declared,
+                self.limit
+            );
         }
+        if total > self.data.capacity() {
+            // Grow by doubling as Vec would, but never past the limit
+            let target = total
+                .max(self.data.capacity().saturating_mul(2))
+                .min(self.limit);
+            self.data.reserve_exact(target - self.data.len());
+        }
+        self.data.extend_from_slice(chunk);
+        Ok(())
     }
 
     fn len(&self) -> usize {
@@ -70,8 +91,9 @@ impl BcCamera {
     /// Get the snapshot image, holding at most `limit` bytes of it.
     ///
     /// Returns [`Error::SnapshotTooLarge`] when the size the camera declares
-    /// is over `limit`, before any image byte is read, or when the camera
-    /// sends more bytes than it declared. On that error the subscription for
+    /// is over `limit`, before any image byte is read, or when the bytes the
+    /// camera sends would pass `limit`. Bytes past the declared size are
+    /// accepted up to `limit`, with a debug log line. On that error the subscription for
     /// the image is dropped and the connection stays open. Packets the camera
     /// still sends for the refused image are ignored by the connection.
     pub async fn get_snapshot_with_limit(&self, limit: usize) -> Result<Vec<u8>> {
@@ -268,36 +290,54 @@ mod tests {
     }
 
     #[test]
-    fn buffer_refuses_data_past_the_declared_size() {
+    fn buffer_accepts_data_past_the_declared_size_up_to_the_limit() {
+        // A camera that sends a few bytes more than it declares, as before
         let mut buf = SnapshotBuffer::new(100, 4096).expect("declared under limit");
         buf.push(&[1u8; 60]).expect("first chunk");
-        match buf.push(&[2u8; 41]) {
+        buf.push(&[2u8; 48])
+            .expect("past the declared size, under the limit");
+        assert_eq!(buf.len(), 108);
+        assert!(buf.data.capacity() <= 4096);
+    }
+
+    #[test]
+    fn buffer_refuses_a_chunk_past_the_limit_whole() {
+        let mut buf = SnapshotBuffer::new(100, 200).expect("declared under limit");
+        buf.push(&[1u8; 150])
+            .expect("past the declared size, under the limit");
+        match buf.push(&[2u8; 51]) {
             Err(Error::SnapshotTooLarge {
                 declared: 100,
-                received: 60,
-                limit: 4096,
+                received: 150,
+                limit: 200,
             }) => {}
             other => panic!("expected SnapshotTooLarge, got {:?}", other),
         }
-        // Nothing of the refused chunk is kept and nothing grew
-        assert_eq!(buf.len(), 60);
-        assert!(buf.data.capacity() <= 100);
+        // Nothing of the refused chunk is kept and nothing grew past the limit
+        assert_eq!(buf.len(), 150);
+        assert!(buf.data.capacity() <= 200);
+        buf.push(&[3u8; 50]).expect("exactly the limit");
+        assert_eq!(buf.len(), 200);
     }
 
     #[test]
     fn buffer_never_holds_more_than_the_limit() {
         let limit = 1024;
-        let mut buf = SnapshotBuffer::new(limit, limit).expect("declared at the limit");
-        let mut refused = false;
-        for _ in 0..100 {
-            if buf.push(&[7u8; 100]).is_err() {
-                refused = true;
-                break;
+        // Declared at the limit, and declared as zero, which grows from empty
+        for declared in [limit, 0] {
+            let mut buf = SnapshotBuffer::new(declared, limit).expect("declared at most the limit");
+            let mut refused = false;
+            for _ in 0..100 {
+                if buf.push(&[7u8; 100]).is_err() {
+                    refused = true;
+                    break;
+                }
+                assert!(buf.data.capacity() <= limit);
             }
+            assert!(refused);
+            assert_eq!(buf.len(), 1000);
+            assert!(buf.data.capacity() <= limit);
         }
-        assert!(refused);
-        assert_eq!(buf.len(), 1000);
-        assert!(buf.data.capacity() <= limit);
     }
 
     #[test]
@@ -423,7 +463,27 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn snapshot_past_its_declared_size_is_refused_and_the_connection_works() {
+    async fn snapshot_a_little_past_its_declared_size_is_accepted() {
+        // The camera declares 8000 bytes and sends 8100, which neolink has
+        // always accepted
+        let picture = image(8100);
+        let (camera, _) = fake_camera(vec![Plan {
+            declared: 8000,
+            chunks: picture.chunks(4096).map(<[u8]>::to_vec).collect(),
+        }])
+        .await;
+        let got = tokio::time::timeout(
+            Duration::from_secs(60),
+            camera.get_snapshot_with_limit(16_384),
+        )
+        .await
+        .expect("snapshot hung")
+        .expect("snapshot");
+        assert_eq!(got, picture);
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn snapshot_past_the_limit_is_refused_and_the_connection_works() {
         // The camera declares 8000 bytes and sends 100 packets of 4096
         let good = image(3000);
         let (camera, _) = fake_camera(vec![
@@ -443,10 +503,11 @@ mod tests {
         )
         .await
         .expect("snapshot hung");
+        // Four packets fill the limit exactly and the fifth is refused
         match refused {
             Err(Error::SnapshotTooLarge {
                 declared: 8000,
-                received: 4096,
+                received: 16_384,
                 limit: 16_384,
             }) => {}
             other => panic!("expected SnapshotTooLarge, got {:?}", other),
